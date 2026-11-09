@@ -89,6 +89,7 @@ DEFAULT_ODOO_DB = get_config("ODOO_DB", "kultiva")
 DEFAULT_ODOO_USER = get_config("ODOO_USERNAME", "ppicjkt@kultivaco.com")
 DEFAULT_ODOO_KEY = get_config("ODOO_API_KEY", _DEF_ODOO_KEY)
 DEFAULT_GEMINI_KEY = get_config("GEMINI_API_KEY", _DEF_GEM_KEY)
+DEFAULT_CLAUDE_KEY = get_config("ANTHROPIC_API_KEY", "")
 
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
@@ -101,9 +102,28 @@ with st.sidebar:
     odoo_user = st.text_input("Username / Email", value=DEFAULT_ODOO_USER)
     odoo_api_key = st.text_input("API Key / Password", value=DEFAULT_ODOO_KEY, type="password")
     
-    st.subheader("AI Configuration")
-    gemini_key = st.text_input("Google Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
-    gemini_model = st.selectbox("Gemini Model", ["gemini-3.5-flash-lite", "gemini-2.5-flash"], index=0)
+    st.subheader("AI Engine Configuration")
+    ai_provider = st.radio(
+        "Choose AI Engine",
+        ["Google Gemini", "Anthropic Claude"],
+        index=0,
+        horizontal=True
+    )
+    
+    if ai_provider == "Google Gemini":
+        gemini_key = st.text_input("Google Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
+        gemini_model = st.selectbox("Gemini Model", ["gemini-3.5-flash-lite", "gemini-2.5-flash"], index=0)
+        claude_key = ""
+        claude_model = ""
+    else:
+        claude_key = st.text_input("Anthropic Claude API Key", value=DEFAULT_CLAUDE_KEY, type="password", placeholder="sk-ant-api03-...")
+        claude_model = st.selectbox(
+            "Claude Model",
+            ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
+            index=0
+        )
+        gemini_key = ""
+        gemini_model = ""
     
     st.divider()
     active_company = st.selectbox(
@@ -345,29 +365,82 @@ with tab_po:
             auto_confirm_order = st.checkbox("Automatically confirm Sales Order (Action Confirm) upon creation", value=False)
             force_recreate = st.checkbox("Force create if matching PO already exists in Odoo", value=False)
             
-            if st.button("🚀 Analyze PO with AI & Match Odoo Products", type="primary", use_container_width=True):
-                with st.spinner("🤖 Analyzing document with Gemini AI..."):
+            if st.button(f"🚀 Analyze PO with {ai_provider} & Match Odoo Products", type="primary", use_container_width=True):
+                with st.spinner(f"🤖 Analyzing document with {ai_provider}..."):
                     try:
-                        ai_client = genai.Client(api_key=gemini_key)
-                        response = ai_client.models.generate_content(
-                            model=gemini_model,
-                            contents=[
-                                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                                (
+                        extracted_dict = None
+                        if ai_provider == "Google Gemini":
+                            if not gemini_key:
+                                st.error("Please enter a Google Gemini API Key.")
+                                st.stop()
+                            ai_client = genai.Client(api_key=gemini_key)
+                            response = ai_client.models.generate_content(
+                                model=gemini_model,
+                                contents=[
+                                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                                    (
+                                        "Extract all purchase order details precisely from this document. "
+                                        "CRITICAL: The customer_name MUST be the BUYER company issuing the PO (e.g. PT Astro Indokarya Semesta, Seastar, Fore, Healthy Living, Body Absolute, Sangla Foods, Sahabat Berjaya). "
+                                        "DO NOT set PT Alpha Mas Indo or PT Kultiva Indonesia Makmur as customer; they are our internal fulfilling companies receiving the order."
+                                    )
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    response_schema=PurchaseOrderExtraction,
+                                    temperature=0.1,
+                                ),
+                            )
+                            extracted_dict = json.loads(response.text)
+                        else:
+                            # Anthropic Claude
+                            import anthropic
+                            if not claude_key:
+                                st.error("Please enter an Anthropic Claude API Key (sk-ant-...).")
+                                st.stop()
+                            cl_client = anthropic.Anthropic(api_key=claude_key)
+                            b64_data = base64.b64encode(file_bytes).decode("ascii")
+                            content_blocks = []
+                            if mime_type == "application/pdf":
+                                content_blocks.append({
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": b64_data,
+                                    }
+                                })
+                            else:
+                                media_t = mime_type if mime_type.startswith("image/") else "image/jpeg"
+                                content_blocks.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_t,
+                                        "data": b64_data,
+                                    }
+                                })
+                            schema_desc = json.dumps(PurchaseOrderExtraction.model_json_schema(), indent=2)
+                            content_blocks.append({
+                                "type": "text",
+                                "text": (
                                     "Extract all purchase order details precisely from this document. "
                                     "CRITICAL: The customer_name MUST be the BUYER company issuing the PO (e.g. PT Astro Indokarya Semesta, Seastar, Fore, Healthy Living, Body Absolute, Sangla Foods, Sahabat Berjaya). "
-                                    "DO NOT set PT Alpha Mas Indo or PT Kultiva Indonesia Makmur as customer; they are our internal fulfilling companies receiving the order."
+                                    "DO NOT set PT Alpha Mas Indo or PT Kultiva Indonesia Makmur as customer; they are our internal fulfilling companies receiving the order.\n\n"
+                                    f"Respond ONLY with a valid JSON object matching this schema:\n{schema_desc}"
                                 )
-                            ],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=PurchaseOrderExtraction,
-                                temperature=0.1,
-                            ),
-                        )
-                        st.session_state["extracted_po"] = json.loads(response.text)
+                            })
+                            claude_res = cl_client.messages.create(
+                                model=claude_model,
+                                max_tokens=4096,
+                                messages=[{"role": "user", "content": content_blocks}]
+                            )
+                            raw_text = claude_res.content[0].text
+                            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                            extracted_dict = json.loads(json_match.group(0)) if json_match else json.loads(raw_text)
+
+                        st.session_state["extracted_po"] = extracted_dict
                         st.session_state["uploaded_file_info"] = {"name": file_name, "bytes": file_bytes}
-                        st.success("✅ Document analyzed successfully!")
+                        st.success(f"✅ Document analyzed successfully with {ai_provider}!")
                     except Exception as e:
                         st.error(f"Error during AI extraction: {e}")
 
@@ -616,23 +689,125 @@ with tab_assistant:
         st.chat_message("user").write(user_query)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking and querying Odoo..."):
+            with st.spinner(f"Thinking and querying Odoo with {ai_provider}..."):
                 try:
-                    ai_client = genai.Client(api_key=gemini_key)
-                    chat = ai_client.chats.create(
-                        model=gemini_model,
-                        config={
-                            "tools": [search_odoo_records, get_odoo_fields, find_odoo_models, execute_odoo_method],
-                            "system_instruction": (
-                                f"You are an expert Odoo ERP assistant connected to Kultiva and Alpha Mas Indo Odoo instance. "
-                                f"Current company context is ID: {company_id_val}. "
-                                f"Use the tools provided to query models like sale.order, res.partner, product.product, and ir.attachment. "
-                                f"Always format your replies cleanly with markdown tables and bullet points."
+                    reply_text = ""
+                    if ai_provider == "Google Gemini":
+                        if not gemini_key:
+                            st.error("Please enter a Google Gemini API Key.")
+                            st.stop()
+                        ai_client = genai.Client(api_key=gemini_key)
+                        chat = ai_client.chats.create(
+                            model=gemini_model,
+                            config={
+                                "tools": [search_odoo_records, get_odoo_fields, find_odoo_models, execute_odoo_method],
+                                "system_instruction": (
+                                    f"You are an expert Odoo ERP assistant connected to Kultiva and Alpha Mas Indo Odoo instance. "
+                                    f"Current company context is ID: {company_id_val}. "
+                                    f"Use the tools provided to query models like sale.order, res.partner, product.product, and ir.attachment. "
+                                    f"Always format your replies cleanly with markdown tables and bullet points."
+                                )
+                            }
+                        )
+                        reply = chat.send_message(user_query)
+                        reply_text = reply.text
+                    else:
+                        # Anthropic Claude
+                        import anthropic
+                        if not claude_key:
+                            st.error("Please enter an Anthropic Claude API Key (sk-ant-...).")
+                            st.stop()
+                        cl_client = anthropic.Anthropic(api_key=claude_key)
+                        claude_tools = [
+                            {
+                                "name": "search_odoo_records",
+                                "description": "Search records in Odoo by model name, domain JSON string, and optional fields list",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "model": {"type": "string"},
+                                        "domain_json": {"type": "string", "description": "Odoo domain as JSON string, e.g. '[[\"name\",\"ilike\",\"Astro\"]]'"},
+                                        "fields_json": {"type": "string", "description": "Fields list as JSON string, e.g. '[\"name\",\"amount_total\"]'"},
+                                        "limit": {"type": "integer"}
+                                    },
+                                    "required": ["model"]
+                                }
+                            },
+                            {
+                                "name": "get_odoo_fields",
+                                "description": "Get field definitions of an Odoo model",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {"model": {"type": "string"}},
+                                    "required": ["model"]
+                                }
+                            },
+                            {
+                                "name": "find_odoo_models",
+                                "description": "Search installed Odoo models by query string",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                    "required": ["query"]
+                                }
+                            },
+                            {
+                                "name": "execute_odoo_method",
+                                "description": "Execute a business method on an Odoo record like action_confirm or action_cancel",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "model": {"type": "string"},
+                                        "record_id": {"type": "integer"},
+                                        "method": {"type": "string"}
+                                    },
+                                    "required": ["model", "record_id", "method"]
+                                }
+                            }
+                        ]
+                        
+                        c_messages = [{"role": "user", "content": user_query}]
+                        c_response = cl_client.messages.create(
+                            model=claude_model,
+                            max_tokens=4096,
+                            tools=claude_tools,
+                            system=f"You are an expert Odoo ERP assistant connected to Kultiva and Alpha Mas Indo Odoo instance. Current company context ID: {company_id_val}. Use the tools provided to query models like sale.order, res.partner, product.product, and format cleanly.",
+                            messages=c_messages
+                        )
+                        
+                        if c_response.stop_reason == "tool_use":
+                            tool_results = []
+                            for b in c_response.content:
+                                if b.type == "tool_use":
+                                    fn_name = b.name
+                                    fn_args = b.input
+                                    if fn_name == "search_odoo_records":
+                                        t_out = search_odoo_records(fn_args.get("model"), fn_args.get("domain_json", "[]"), fn_args.get("fields_json", "[]"), fn_args.get("limit", 15))
+                                    elif fn_name == "get_odoo_fields":
+                                        t_out = get_odoo_fields(fn_args.get("model"))
+                                    elif fn_name == "find_odoo_models":
+                                        t_out = find_odoo_models(fn_args.get("query"))
+                                    elif fn_name == "execute_odoo_method":
+                                        t_out = execute_odoo_method(fn_args.get("model"), fn_args.get("record_id"), fn_args.get("method"))
+                                    else:
+                                        t_out = json.dumps({"error": f"Unknown tool {fn_name}"})
+                                    tool_results.append({
+                                        "type": "tool_result",
+                                        "tool_use_id": b.id,
+                                        "content": t_out
+                                    })
+                            c_messages.append({"role": "assistant", "content": c_response.content})
+                            c_messages.append({"role": "user", "content": tool_results})
+                            c_final = cl_client.messages.create(
+                                model=claude_model,
+                                max_tokens=4096,
+                                tools=claude_tools,
+                                messages=c_messages
                             )
-                        }
-                    )
-                    reply = chat.send_message(user_query)
-                    reply_text = reply.text
+                            reply_text = c_final.content[0].text
+                        else:
+                            reply_text = c_response.content[0].text
+
                     st.write(reply_text)
                     st.session_state["chat_messages"].append({"role": "assistant", "content": reply_text})
                 except Exception as e:
