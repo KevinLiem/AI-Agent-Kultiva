@@ -287,13 +287,13 @@ def process_po_and_create_so(image_path=None, force_create=False):
     # Check for warehouse child partner if specified
     partner_shipping_id = partner_id
     wh_raw = po_data.get("delivery_warehouse") or ""
-    wh_match = re.search(r"(Cibitung|Sentul|Kosambi)", wh_raw, re.IGNORECASE)
+    wh_match = re.search(r"(Cibitung|Sentul|Kosambi|DHL)", wh_raw, re.IGNORECASE)
     if wh_match:
         wh_search = wh_match.group(1)
         wh_partners = models.execute_kw(
             DB, uid, API_KEY,
             "res.partner", "search",
-            [[["parent_id", "=", partner_id], ["name", "ilike", wh_search]]],
+            [[["name", "ilike", wh_search]]],
             {"context": odoo_context}
         )
         if wh_partners:
@@ -354,6 +354,23 @@ def process_po_and_create_so(image_path=None, force_create=False):
         "sale.order", "read",
         [sale_order_id], {"fields": ["name", "amount_total", "company_id"], "context": odoo_context}
     )[0]
+
+    # Attach original PO file to Sales Order
+    try:
+        import base64
+        with open(target_image, "rb") as f_att:
+            b64_data = base64.b64encode(f_att.read()).decode("ascii")
+        att_vals = {
+            "name": os.path.basename(target_image),
+            "datas": b64_data,
+            "mimetype": mimetypes.guess_type(target_image)[0] or "application/octet-stream",
+            "res_model": "sale.order",
+            "res_id": sale_order_id,
+        }
+        models.execute_kw(DB, uid, API_KEY, "ir.attachment", "create", [att_vals], {"context": odoo_context})
+        print(f"📎 Attached {os.path.basename(target_image)} to {so_rec['name']}")
+    except Exception as e_att:
+        print(f"⚠️ Note: could not attach file: {e_att}")
 
     print(f"\n🎉 SUCCESS! Sales Order created: {so_rec['name']} (ID: {sale_order_id}) in {so_rec['company_id'][1]}")
     print(f"   Total Amount: Rp {so_rec['amount_total']:,.0f}")

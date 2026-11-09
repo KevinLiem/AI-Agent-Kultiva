@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import base64
 import mimetypes
 import xmlrpc.client
 import streamlit as st
@@ -12,8 +13,8 @@ from google.genai import types
 
 # Page Configuration
 st.set_page_config(
-    page_title="PO to Sales Order Agent",
-    page_icon="📦",
+    page_title="Kultiva & Alpha Mas Indo — Odoo AI Suite",
+    page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -22,22 +23,15 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.2rem;
+        font-size: 2.1rem;
         font-weight: 700;
         color: #1E3A8A;
         margin-bottom: 0.2rem;
     }
     .sub-header {
-        font-size: 1.05rem;
+        font-size: 1.0rem;
         color: #4B5563;
-        margin-bottom: 1.5rem;
-    }
-    .status-card {
-        padding: 1.2rem;
-        border-radius: 0.6rem;
-        background-color: #F3F4F6;
-        margin-bottom: 1rem;
-        border-left: 5px solid #2563EB;
+        margin-bottom: 1.2rem;
     }
     .badge-alpha {
         background-color: #DBEAFE;
@@ -55,11 +49,19 @@ st.markdown("""
         font-weight: 600;
         display: inline-block;
     }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        font-size: 16px;
+        font-weight: 600;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- CONFIGURATION DEFAULTS ---
-# Automatically load local .env file if present
+# --- ENVIRONMENT & SECRETS CONFIGURATION ---
 if os.path.exists(".env"):
     try:
         with open(".env", "r", encoding="utf-8") as f:
@@ -78,36 +80,100 @@ def get_config(key, default=""):
         pass
     return os.getenv(key, default)
 
-URL = get_config("ODOO_URL", "https://kultiva.odoo.com")
-DB = get_config("ODOO_DB", "kultiva")
-USERNAME = get_config("ODOO_USERNAME", "ppicjkt@kultivaco.com")
-DEFAULT_ODOO_API_KEY = get_config("ODOO_API_KEY", "")
-DEFAULT_GEMINI_API_KEY = get_config("GEMINI_API_KEY", "")
+DEFAULT_ODOO_URL = get_config("ODOO_URL", "https://kultiva.odoo.com")
+DEFAULT_ODOO_DB = get_config("ODOO_DB", "kultiva")
+DEFAULT_ODOO_USER = get_config("ODOO_USERNAME", "ppicjkt@kultivaco.com")
+DEFAULT_ODOO_KEY = get_config("ODOO_API_KEY", "")
+DEFAULT_GEMINI_KEY = get_config("GEMINI_API_KEY", "")
 
-# --- SIDEBAR SETTINGS ---
+# --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/purchase-order.png", width=64)
-    st.title("⚙️ Settings")
+    st.image("https://img.icons8.com/color/96/purchase-order.png", width=56)
+    st.title("⚙️ ERP & AI Settings")
     
     st.subheader("Odoo Credentials")
-    st.caption(f"Server: `{URL}` | DB: `{DB}`")
-    api_key = st.text_input("Odoo API Key", value=DEFAULT_ODOO_API_KEY, type="password")
+    odoo_url = st.text_input("Server URL", value=DEFAULT_ODOO_URL)
+    odoo_db = st.text_input("Database Name", value=DEFAULT_ODOO_DB)
+    odoo_user = st.text_input("Username / Email", value=DEFAULT_ODOO_USER)
+    odoo_api_key = st.text_input("API Key / Password", value=DEFAULT_ODOO_KEY, type="password")
     
     st.subheader("AI Configuration")
-    gemini_key = st.text_input("Gemini API Key", value=DEFAULT_GEMINI_API_KEY, type="password")
+    gemini_key = st.text_input("Google Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
     gemini_model = st.selectbox("Gemini Model", ["gemini-3.5-flash-lite", "gemini-2.5-flash"], index=0)
     
     st.divider()
-    force_create = st.checkbox("Force create if SO already exists", value=False, help="Create a new SO even if a matching PO number exists in Odoo")
+    active_company = st.selectbox(
+        "Default Odoo Company Context",
+        ["PT Alpha Mas Indo (ID: 8)", "PT Kultiva Indonesia Makmur (ID: 1)"],
+        index=0
+    )
+    company_id_val = 8 if "Alpha Mas" in active_company else 1
     
-    st.caption("AI Agent v2.0 • Auto Multi-Company Routing")
+    st.caption("AI Agent v2.5 • Unified PO Automation & ERP Agent")
 
-# --- EXTRACTION SCHEMA ---
+# --- ODOO API CLIENT WRAPPER ---
+class OdooClientWrapper:
+    def __init__(self, url, db, username, api_key):
+        self.url = url.strip().rstrip("/")
+        if not self.url.startswith(("http://", "https://")):
+            self.url = "https://" + self.url
+        self.db = db
+        self.username = username
+        self.api_key = api_key
+        self.common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common", allow_none=True)
+        self.models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object", allow_none=True)
+        self._uid = None
+
+    def authenticate(self):
+        if not self._uid:
+            self._uid = self.common.authenticate(self.db, self.username, self.api_key, {})
+            if not self._uid:
+                raise RuntimeError("Odoo authentication failed. Check credentials in sidebar.")
+        return self._uid
+
+    def call(self, model, method, args=None, kwargs=None, company_id=None):
+        uid = self.authenticate()
+        kwargs = dict(kwargs or {})
+        ctx = kwargs.get("context", {})
+        if company_id:
+            ctx.setdefault("allowed_company_ids", [company_id, 1])
+            ctx.setdefault("company_id", company_id)
+        kwargs["context"] = ctx
+        return self.models.execute_kw(self.db, uid, self.api_key, model, method, args or [], kwargs)
+
+    def search_read(self, model, domain=None, fields=None, limit=20, order=None, company_id=None):
+        kwargs = {"limit": limit}
+        if fields:
+            kwargs["fields"] = fields
+        if order:
+            kwargs["order"] = order
+        return self.call(model, "search_read", [domain or []], kwargs, company_id=company_id)
+
+    def attach_file(self, file_name, file_bytes, res_model=None, res_id=None, company_id=None):
+        data_b64 = base64.b64encode(file_bytes).decode("ascii")
+        mime = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        vals = {
+            "name": file_name,
+            "datas": data_b64,
+            "mimetype": mime
+        }
+        if res_model and res_id:
+            vals["res_model"] = res_model
+            vals["res_id"] = int(res_id)
+        return self.call("ir.attachment", "create", [vals], company_id=company_id)
+
+@st.cache_resource
+def get_odoo_client(url, db, user, key):
+    return OdooClientWrapper(url, db, user, key)
+
+odoo = get_odoo_client(odoo_url, odoo_db, odoo_user, odoo_api_key)
+
+# --- PO EXTRACTION SCHEMA ---
 class PurchaseOrderItem(BaseModel):
     kode_barang: str = Field(default="", description="Barcode or item code, if available")
     nama_barang: str = Field(description="Product name or description of goods")
-    quantity: float = Field(description="Quantity in packs or units")
-    uom: str = Field(default="PCS", description="Unit of Measure, e.g. PACKS or PCS")
+    quantity: float = Field(description="Quantity in packs, units, or cartons")
+    uom: str = Field(default="PCS", description="Unit of Measure, e.g. PACKS, PCS, CTN")
     unit_price: float | None = Field(default=None, description="Unit price (@Harga), if available")
 
 class PurchaseOrderExtraction(BaseModel):
@@ -119,7 +185,7 @@ class PurchaseOrderExtraction(BaseModel):
     notes: str | None = Field(default=None, description="Delivery notes or remarks")
     items: list[PurchaseOrderItem] = Field(description="List of items in the PO")
 
-# --- COMPANY ROUTING HELPER ---
+# --- MULTI-CLIENT & COMPANY ROUTING ---
 def get_client_and_company(customer_name, items=None):
     name_upper = (customer_name or "").upper()
     
@@ -174,16 +240,15 @@ def get_client_and_company(customer_name, items=None):
         return 1, "PT Kultiva Indonesia Makmur", client_tag
 
 # --- PRODUCT MATCHER ---
-def match_product(models, uid, item, existing_products, client_tag=None, odoo_context=None):
+def match_product(odoo_client, item, existing_products, client_tag=None, company_id=None):
     barcode = str(item.get("kode_barang", "")).strip()
 
     # 1. Check Odoo barcode field
     if barcode:
-        product_ids = models.execute_kw(
-            DB, uid, api_key,
+        product_ids = odoo_client.call(
             "product.product", "search",
             [[["barcode", "=", barcode]]],
-            {"context": odoo_context or {}}
+            company_id=company_id
         )
         if product_ids:
             return product_ids[0]
@@ -199,7 +264,7 @@ def match_product(models, uid, item, existing_products, client_tag=None, odoo_co
         if client_candidates:
             candidate_products = client_candidates
         else:
-            other_brands = ["ASTRO", "SEASTAR", "RAVA", "FORE", "WOH", "SANGLA", "SUNNANZ", "EXOTIQUE", "DREIHA"]
+            other_brands = ["ASTRO", "SEASTAR", "RAVA", "FORE", "WOH", "SANGLA", "SUNNANZ", "EXOTIQUE", "DREIHA", "KRACKLES", "BRUNEI", "EVIL SNACKS", "HEALTHY LIVING"]
             excluded_brands = [b for b in other_brands if b != tag_upper]
             candidate_products = [
                 p for p in existing_products
@@ -211,8 +276,8 @@ def match_product(models, uid, item, existing_products, client_tag=None, odoo_co
         t = text.lower()
         if client_tag:
             t = t.replace(f"[{client_tag.lower()}]", "").replace(f"[{client_tag.lower()} goods]", "").replace(client_tag.lower(), "")
-        t = t.replace("[astro goods]", "").replace("[astro]", "")
-        t = t.replace("chips", "").replace("tempeh", "tempe").replace("-", "")
+        t = t.replace("[astro goods]", "").replace("[astro]", "").replace("[fore]", "").replace("[seastar]", "").replace("[sangla]", "")
+        t = t.replace("chips", "").replace("tempeh", "tempe").replace("keripik", "").replace("-", "")
         t = re.sub(r"(\d+)\s*g(r)?", r"\1gr", t)
         return set(re.findall(r"\w+", t))
 
@@ -228,246 +293,395 @@ def match_product(models, uid, item, existing_products, client_tag=None, odoo_co
             best_score = sim
             best_id = prod["id"]
 
-    if best_id and best_score >= 0.25:
+    if best_id and best_score >= 0.20:
         return best_id
     return None
 
-# --- MAIN UI ---
-st.markdown('<div class="main-header">📦 Purchase Order to Sales Order Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Upload a Purchase Order (PDF or Image) to extract items, match Odoo products, and create a Sales Order automatically.</div>', unsafe_allow_html=True)
+# --- HEADER TITLE ---
+st.markdown('<div class="main-header">🚀 Kultiva & Alpha Mas Indo — Odoo AI Suite</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Automated PO to Sales Order Processing • Odoo External API Integration • Interactive ERP Chat Agent</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader(
-    "Choose a Purchase Order file",
-    type=["pdf", "jpeg", "jpg", "png"],
-    help="Supports PDF, JPEG, JPG, and PNG purchase orders"
-)
+# TABS INTERFACE
+tab_po, tab_assistant, tab_explorer = st.tabs([
+    "📄 Purchase Order AI Agent",
+    "💬 Odoo Natural Language Assistant",
+    "🔍 Odoo Records Explorer"
+])
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
-    file_name = uploaded_file.name
-    mime_type = uploaded_file.type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+# ==============================================================================
+# TAB 1: PURCHASE ORDER AI AGENT
+# ==============================================================================
+with tab_po:
+    st.caption("Upload any Purchase Order (`.pdf`, `.jpeg`, `.jpg`, `.png`). The agent extracts items, matches products in Odoo, attaches the file, and creates the Sales Order.")
 
-    col_preview, col_action = st.columns([1, 2])
-    
-    with col_preview:
-        st.subheader("📄 Uploaded File")
-        st.caption(f"**Name:** `{file_name}` | **Size:** `{len(file_bytes)/1024:.1f} KB`")
-        if mime_type.startswith("image/"):
-            st.image(file_bytes, use_container_width=True)
-        elif mime_type == "application/pdf":
-            st.info("📑 PDF Document loaded ready for processing.")
+    po_upload = st.file_uploader(
+        "Upload Purchase Order File",
+        type=["pdf", "jpeg", "jpg", "png"],
+        key="po_file_uploader",
+        help="Upload PO file from any client (Astro, Fore, Seastar, Sangla, Healthy Living, Tibicos, Brunei, Evil Snacks, Rava)"
+    )
+
+    if po_upload is not None:
+        file_bytes = po_upload.read()
+        file_name = po_upload.name
+        mime_type = po_upload.type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+        col_left, col_right = st.columns([1, 2])
+        
+        with col_left:
+            st.subheader("📄 Uploaded File")
+            st.caption(f"**Name:** `{file_name}` | **Size:** `{len(file_bytes)/1024:.1f} KB`")
+            if mime_type.startswith("image/"):
+                st.image(file_bytes, use_container_width=True)
+            elif mime_type == "application/pdf":
+                st.info("📑 PDF Document loaded ready for processing.")
+                
+        with col_right:
+            st.subheader("⚡ Document Processing")
+            auto_confirm_order = st.checkbox("Automatically confirm Sales Order (Action Confirm) upon creation", value=False)
+            force_recreate = st.checkbox("Force create if matching PO already exists in Odoo", value=False)
             
-    with col_action:
-        st.subheader("⚡ Process Order")
-        if st.button("🚀 Analyze Document with AI & Match Odoo Products", type="primary", use_container_width=True):
-            with st.spinner("🤖 Analyzing document with Gemini AI..."):
+            if st.button("🚀 Analyze PO with AI & Match Odoo Products", type="primary", use_container_width=True):
+                with st.spinner("🤖 Analyzing document with Gemini AI..."):
+                    try:
+                        ai_client = genai.Client(api_key=gemini_key)
+                        response = ai_client.models.generate_content(
+                            model=gemini_model,
+                            contents=[
+                                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                                (
+                                    "Extract all purchase order details precisely from this document. "
+                                    "CRITICAL: The customer_name MUST be the BUYER company issuing the PO (e.g. PT Astro Indokarya Semesta, Seastar, Fore, Healthy Living, Body Absolute, Sangla Foods, Sahabat Berjaya). "
+                                    "DO NOT set PT Alpha Mas Indo or PT Kultiva Indonesia Makmur as customer; they are our internal fulfilling companies receiving the order."
+                                )
+                            ],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=PurchaseOrderExtraction,
+                                temperature=0.1,
+                            ),
+                        )
+                        st.session_state["extracted_po"] = json.loads(response.text)
+                        st.session_state["uploaded_file_info"] = {"name": file_name, "bytes": file_bytes}
+                        st.success("✅ Document analyzed successfully!")
+                    except Exception as e:
+                        st.error(f"Error during AI extraction: {e}")
+
+        # Display Extraction & Matching
+        if "extracted_po" in st.session_state:
+            po_data = st.session_state["extracted_po"]
+            items_objs = [PurchaseOrderItem(**it) for it in po_data.get("items", [])]
+            target_company_id, target_company_name, client_tag = get_client_and_company(po_data["customer_name"], items=items_objs)
+            
+            st.divider()
+            st.subheader("📋 Order Details & Routing")
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("PO Number", po_data["po_number"])
+            m2.metric("Customer", po_data["customer_name"])
+            m3.metric("Order Date", po_data["po_date"])
+            m4.metric("Shipping Date", po_data.get("shipping_date") or "-")
+            
+            badge_class = "badge-alpha" if target_company_id == 8 else "badge-kultiva"
+            st.markdown(f"""
+            <div style="margin-top: 10px; margin-bottom: 20px;">
+                <strong>Target Odoo Company:</strong> <span class="{badge_class}">{target_company_name} (ID: {target_company_id})</span>
+                &nbsp;|&nbsp; <strong>Brand Scope:</strong> <code>[{client_tag}]</code>
+                &nbsp;|&nbsp; <strong>Warehouse / Ship To:</strong> <code>{po_data.get('delivery_warehouse') or 'Main'}</code>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            with st.spinner("Connecting to Odoo and matching products..."):
                 try:
-                    client = genai.Client(api_key=gemini_key)
-                    response = client.models.generate_content(
-                        model=gemini_model,
-                        contents=[
-                            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                            (
-                                "Extract all purchase order details precisely from this document. "
-                                "CRITICAL: The customer_name MUST be the BUYER company issuing the PO (e.g. PT Astro Indokarya Semesta, Seastar, Fore). "
-                                "DO NOT set PT Alpha Mas Indo or PT Kultiva Indonesia Makmur as the customer; they are our internal companies receiving/fulfilling the order."
-                            )
-                        ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=PurchaseOrderExtraction,
-                            temperature=0.1,
-                        ),
+                    # Check existing SO
+                    existing_sos = odoo.search_read(
+                        "sale.order",
+                        domain=[["client_order_ref", "=", po_data["po_number"]], ["company_id", "=", target_company_id]],
+                        fields=["id", "name", "state", "amount_total", "company_id"],
+                        company_id=target_company_id
                     )
-                    po_data = json.loads(response.text)
-                    st.session_state["po_data"] = po_data
-                    st.success("✅ Extraction complete!")
-                except Exception as e:
-                    st.error(f"Error during AI extraction: {e}")
-
-    # Display Extracted Info & Matching
-    if "po_data" in st.session_state:
-        po_data = st.session_state["po_data"]
-        items_objs = [PurchaseOrderItem(**it) for it in po_data.get("items", [])]
-        target_company_id, target_company_name, client_tag = get_client_and_company(po_data["customer_name"], items=items_objs)
-        
-        st.divider()
-        st.subheader("📋 Order Details & Company Routing")
-        
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("PO Number", po_data["po_number"])
-        m2.metric("Customer", po_data["customer_name"])
-        m3.metric("Order Date", po_data["po_date"])
-        m4.metric("Shipping Date", po_data.get("shipping_date") or "-")
-        
-        badge_class = "badge-alpha" if target_company_id == 8 else "badge-kultiva"
-        st.markdown(f"""
-        <div style="margin-top: 10px; margin-bottom: 20px;">
-            <strong>Target Odoo Company:</strong> <span class="{badge_class}">{target_company_name} (ID: {target_company_id})</span>
-            &nbsp;|&nbsp; <strong>Brand Scope:</strong> <code>[{client_tag}]</code>
-            &nbsp;|&nbsp; <strong>Warehouse:</strong> <code>{po_data.get('delivery_warehouse') or 'Main'}</code>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Connect to Odoo and fetch products
-        odoo_context = {"allowed_company_ids": [target_company_id, 1], "company_id": target_company_id}
-        
-        with st.spinner("Connecting to Odoo and matching products..."):
-            try:
-                common = xmlrpc.client.ServerProxy(f"{URL}/xmlrpc/2/common")
-                uid = common.authenticate(DB, USERNAME, api_key, {})
-                if not uid:
-                    st.error("❌ Odoo authentication failed. Please verify your API key in the sidebar.")
-                    st.stop()
-                models = xmlrpc.client.ServerProxy(f"{URL}/xmlrpc/2/object")
-                
-                # Check for existing Sales Order
-                existing_sos = models.execute_kw(
-                    DB, uid, api_key,
-                    "sale.order", "search_read",
-                    [[["client_order_ref", "=", po_data["po_number"]], ["company_id", "=", target_company_id]]],
-                    {"fields": ["id", "name", "state", "amount_total", "company_id"], "order": "id desc", "context": odoo_context}
-                )
-                
-                # Fetch candidate products
-                odoo_products = models.execute_kw(
-                    DB, uid, api_key,
-                    "product.product", "search_read",
-                    [[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "], ["name", "not ilike", "Sticker "]]],
-                    {"fields": ["id", "name", "list_price", "barcode"], "context": odoo_context}
-                )
-                
-                # Match items
-                table_rows = []
-                unmatched = []
-                order_lines_payload = []
-                grand_total = 0.0
-                
-                for item in po_data["items"]:
-                    pid = match_product(models, uid, item, odoo_products, client_tag=client_tag, odoo_context=odoo_context)
-                    if pid:
-                        rec = next(p for p in odoo_products if p["id"] == pid)
-                        unit_price = item.get("unit_price") if item.get("unit_price") is not None else rec["list_price"]
-                        subtotal = item["quantity"] * unit_price
-                        grand_total += subtotal
-                        table_rows.append({
-                            "Status": "✅ Matched",
-                            "PO Description": item["nama_barang"],
-                            "Barcode": item.get("kode_barang") or "-",
-                            "Matched Odoo Product": rec["name"],
-                            "Qty": f"{item['quantity']:,.0f} {item.get('uom', 'PCS')}",
-                            "Unit Price": f"Rp {unit_price:,.0f}",
-                            "Subtotal": f"Rp {subtotal:,.0f}"
-                        })
-                        order_lines_payload.append((0, 0, {
-                            "product_id": pid,
-                            "name": rec["name"],
-                            "product_uom_qty": item["quantity"],
-                            "price_unit": unit_price,
-                        }))
+                    
+                    # Fetch candidate products (excluding packaging and raw materials)
+                    odoo_products = odoo.search_read(
+                        "product.product",
+                        domain=[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "], ["name", "not ilike", "Sticker "]],
+                        fields=["id", "name", "list_price", "barcode"],
+                        limit=500,
+                        company_id=target_company_id
+                    )
+                    
+                    # Match items
+                    table_rows = []
+                    unmatched = []
+                    order_lines_payload = []
+                    grand_total = 0.0
+                    
+                    for item in po_data["items"]:
+                        pid = match_product(odoo, item, odoo_products, client_tag=client_tag, company_id=target_company_id)
+                        if pid:
+                            rec = next(p for p in odoo_products if p["id"] == pid)
+                            unit_price = item.get("unit_price") if item.get("unit_price") is not None else rec["list_price"]
+                            subtotal = item["quantity"] * unit_price
+                            grand_total += subtotal
+                            table_rows.append({
+                                "Status": "✅ Matched",
+                                "PO Description": item["nama_barang"],
+                                "Barcode": item.get("kode_barang") or "-",
+                                "Matched Odoo Product": rec["name"],
+                                "Qty": f"{item['quantity']:,.0f} {item.get('uom', 'PCS')}",
+                                "Unit Price": f"Rp {unit_price:,.0f}",
+                                "Subtotal": f"Rp {subtotal:,.0f}"
+                            })
+                            order_lines_payload.append((0, 0, {
+                                "product_id": pid,
+                                "name": rec["name"],
+                                "product_uom_qty": item["quantity"],
+                                "price_unit": unit_price,
+                            }))
+                        else:
+                            table_rows.append({
+                                "Status": "❌ Not Found",
+                                "PO Description": item["nama_barang"],
+                                "Barcode": item.get("kode_barang") or "-",
+                                "Matched Odoo Product": "None",
+                                "Qty": f"{item['quantity']:,.0f}",
+                                "Unit Price": "-",
+                                "Subtotal": "-"
+                            })
+                            unmatched.append(item["nama_barang"])
+                    
+                    st.subheader(f"📦 Product Line Items ({len(table_rows)} items)")
+                    df = pd.DataFrame(table_rows)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    
+                    c_tot1, c_tot2 = st.columns([3, 1])
+                    with c_tot2:
+                        st.metric("Total Order Amount", f"Rp {grand_total:,.0f}")
+                    
+                    if unmatched:
+                        st.warning(f"⚠️ {len(unmatched)} product(s) could not be matched automatically. Please review above.")
+                    
+                    st.divider()
+                    
+                    # Duplicate warning
+                    if existing_sos and not force_recreate:
+                        latest = existing_sos[0]
+                        st.warning(f"⚠️ A Sales Order already exists in **{target_company_name}** for PO **{po_data['po_number']}**: **{latest['name']}** (ID: {latest['id']}, State: `{latest['state']}`, Total: Rp {latest['amount_total']:,.0f})")
+                        st.info("💡 To create another order anyway, check 'Force create if matching PO already exists' above.")
                     else:
-                        table_rows.append({
-                            "Status": "❌ Not Found",
-                            "PO Description": item["nama_barang"],
-                            "Barcode": item.get("kode_barang") or "-",
-                            "Matched Odoo Product": "None",
-                            "Qty": f"{item['quantity']:,.0f}",
-                            "Unit Price": "-",
-                            "Subtotal": "-"
-                        })
-                        unmatched.append(item["nama_barang"])
-                
-                st.subheader(f"📦 Product Line Items ({len(table_rows)} items)")
-                df = pd.DataFrame(table_rows)
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                
-                c_tot1, c_tot2 = st.columns([3, 1])
-                with c_tot2:
-                    st.metric("Total Order Amount", f"Rp {grand_total:,.0f}")
-                
-                if unmatched:
-                    st.warning(f"⚠️ {len(unmatched)} product(s) could not be matched automatically. Please review above.")
-                
-                st.divider()
-                
-                # Check Existing Order Warning
-                if existing_sos and not force_create:
-                    latest = existing_sos[0]
-                    st.warning(f"⚠️ A Sales Order already exists in **{target_company_name}** for PO **{po_data['po_number']}**: **{latest['name']}** (Total: Rp {latest['amount_total']:,.0f})")
-                    st.info("💡 If you want to create a new order anyway, check 'Force create if SO already exists' in the sidebar.")
-                else:
-                    if not unmatched:
-                        if st.button(f"✨ Create Sales Order in {target_company_name}", type="primary", use_container_width=True):
-                            with st.spinner("Creating Sales Order in Odoo..."):
-                                # 1. Find Customer Partner
-                                clean_customer = re.sub(r"^(PT\.?|CV\.?)\s*", "", po_data["customer_name"], flags=re.IGNORECASE)
-                                clean_customer = re.sub(r"(CO\.,?\s*LTD\.?|LTD\.?|CORP\.?|INC\.?)$", "", clean_customer, flags=re.IGNORECASE).strip()
-                                
-                                partner_ids = models.execute_kw(
-                                    DB, uid, api_key,
-                                    "res.partner", "search",
-                                    [[["name", "ilike", clean_customer]]],
-                                    {"context": odoo_context}
-                                )
-                                if partner_ids:
-                                    partner_id = partner_ids[0]
-                                else:
-                                    partner_id = models.execute_kw(
-                                        DB, uid, api_key,
-                                        "res.partner", "create",
-                                        [{"name": po_data["customer_name"], "customer_rank": 1, "company_id": target_company_id}],
-                                        {"context": odoo_context}
-                                    )
-                                
-                                # 2. Check Warehouse Partner
-                                partner_shipping_id = partner_id
-                                wh_raw = po_data.get("delivery_warehouse") or ""
-                                wh_match = re.search(r"(Cibitung|Sentul|Kosambi)", wh_raw, re.IGNORECASE)
-                                if wh_match:
-                                    wh_search = wh_match.group(1)
-                                    wh_partners = models.execute_kw(
-                                        DB, uid, api_key,
+                        if not unmatched:
+                            if st.button(f"✨ Create Sales Order in {target_company_name}", type="primary", use_container_width=True):
+                                with st.spinner("Creating Sales Order and attaching PO document in Odoo..."):
+                                    # 1. Resolve Customer Partner
+                                    clean_customer = re.sub(r"^(PT\.?|CV\.?)\s*", "", po_data["customer_name"], flags=re.IGNORECASE)
+                                    clean_customer = re.sub(r"(CO\.,?\s*LTD\.?|LTD\.?|CORP\.?|INC\.?|SDN\s*BHD)$", "", clean_customer, flags=re.IGNORECASE).strip()
+                                    
+                                    partner_ids = odoo.call(
                                         "res.partner", "search",
-                                        [[["parent_id", "=", partner_id], ["name", "ilike", wh_search]]],
-                                        {"context": odoo_context}
+                                        [[["name", "ilike", clean_customer]]],
+                                        company_id=target_company_id
                                     )
-                                    if wh_partners:
-                                        partner_shipping_id = wh_partners[0]
-                                
-                                # 3. Create SO
-                                shipping_str = po_data.get("shipping_date") or ""
-                                notes_str = po_data.get("notes") or ""
-                                so_vals = {
-                                    "company_id": target_company_id,
-                                    "partner_id": partner_shipping_id,
-                                    "partner_shipping_id": partner_shipping_id,
-                                    "client_order_ref": po_data["po_number"],
-                                    "note": f"Keterangan: {notes_str} | Tanggal Kirim: {shipping_str}",
-                                    "order_line": order_lines_payload,
-                                }
-                                
-                                sale_order_id = models.execute_kw(
-                                    DB, uid, api_key,
-                                    "sale.order", "create",
-                                    [so_vals],
-                                    {"context": odoo_context}
-                                )
-                                
-                                so_rec = models.execute_kw(
-                                    DB, uid, api_key,
-                                    "sale.order", "read",
-                                    [sale_order_id], {"fields": ["name", "amount_total", "company_id"], "context": odoo_context}
-                                )[0]
-                                
-                                st.balloons()
-                                st.success(f"🎉 **Sales Order Created Successfully!**")
-                                st.markdown(f"""
-                                - **Order Number:** `{so_rec['name']}` (ID: `{sale_order_id}`)
-                                - **Company:** `{so_rec['company_id'][1]}`
-                                - **Total Amount:** **Rp {so_rec['amount_total']:,.0f}**
-                                """)
-                    else:
-                        st.error("Cannot create Sales Order until all products are matched.")
-            except Exception as e:
-                st.error(f"Error connecting to Odoo: {e}")
+                                    if partner_ids:
+                                        partner_id = partner_ids[0]
+                                    else:
+                                        partner_id = odoo.call(
+                                            "res.partner", "create",
+                                            [{"name": po_data["customer_name"], "customer_rank": 1, "company_id": target_company_id}],
+                                            company_id=target_company_id
+                                        )
+                                    
+                                    # 2. Check Warehouse Partner (DHL, Sentul, Cibitung, Kosambi)
+                                    partner_shipping_id = partner_id
+                                    wh_raw = po_data.get("delivery_warehouse") or ""
+                                    wh_match = re.search(r"(Cibitung|Sentul|Kosambi|DHL)", wh_raw, re.IGNORECASE)
+                                    if wh_match:
+                                        wh_search = wh_match.group(1)
+                                        wh_partners = odoo.call(
+                                            "res.partner", "search",
+                                            [[["name", "ilike", wh_search]]],
+                                            company_id=target_company_id
+                                        )
+                                        if wh_partners:
+                                            partner_shipping_id = wh_partners[0]
+                                    
+                                    # 3. Create Sales Order
+                                    shipping_str = po_data.get("shipping_date") or ""
+                                    notes_str = po_data.get("notes") or ""
+                                    so_vals = {
+                                        "company_id": target_company_id,
+                                        "partner_id": partner_shipping_id,
+                                        "partner_shipping_id": partner_shipping_id,
+                                        "client_order_ref": po_data["po_number"],
+                                        "note": f"Keterangan: {notes_str} | Tanggal Kirim: {shipping_str}",
+                                        "order_line": order_lines_payload,
+                                    }
+                                    
+                                    sale_order_id = odoo.call("sale.order", "create", [so_vals], company_id=target_company_id)
+                                    
+                                    # 4. Attach original PO file to Sales Order
+                                    if "uploaded_file_info" in st.session_state:
+                                        f_info = st.session_state["uploaded_file_info"]
+                                        try:
+                                            odoo.attach_file(
+                                                file_name=f_info["name"],
+                                                file_bytes=f_info["bytes"],
+                                                res_model="sale.order",
+                                                res_id=sale_order_id,
+                                                company_id=target_company_id
+                                            )
+                                        except Exception as e_att:
+                                            st.warning(f"Could not attach original PO file: {e_att}")
+                                    
+                                    # 5. Optional Auto-Confirm
+                                    if auto_confirm_order:
+                                        try:
+                                            odoo.call("sale.order", "action_confirm", [[sale_order_id]], company_id=target_company_id)
+                                        except Exception as e_conf:
+                                            st.warning(f"Order created but confirmation failed: {e_conf}")
+                                    
+                                    so_rec = odoo.call("sale.order", "read", [sale_order_id], {"fields": ["name", "state", "amount_total", "company_id"]}, company_id=target_company_id)[0]
+                                    
+                                    st.balloons()
+                                    st.success("🎉 **Sales Order Created Successfully in Odoo!**")
+                                    st.markdown(f"""
+                                    - **Order Number:** `{so_rec['name']}` (ID: `{sale_order_id}`)
+                                    - **Company:** `{so_rec['company_id'][1]}`
+                                    - **Status:** `{so_rec['state']}`
+                                    - **Total Amount:** **Rp {so_rec['amount_total']:,.0f}**
+                                    - **PO Document:** Attached to order under attachments in Odoo.
+                                    """)
+                        else:
+                            st.error("Cannot create Sales Order until all products are matched.")
+                except Exception as e:
+                    st.error(f"Error communicating with Odoo: {e}")
 
+# ==============================================================================
+# TAB 2: ODOO NATURAL LANGUAGE ASSISTANT (CHAT WITH ERP)
+# ==============================================================================
+with tab_assistant:
+    st.subheader("💬 Ask Odoo in Plain English")
+    st.caption("Ask questions, find customers, check stock, verify sales orders, or trigger actions (confirm order, check models, inspect fields).")
+
+    # Define tools for AI Assistant
+    def search_odoo_records(model: str, domain_json: str = "[]", fields_json: str = "[]", limit: int = 15) -> str:
+        """Search records in Odoo by model name, domain JSON string, and optional fields list."""
+        try:
+            domain = json.loads(domain_json) if domain_json else []
+            fields = json.loads(fields_json) if fields_json else None
+            records = odoo.search_read(model, domain=domain, fields=fields, limit=limit, company_id=company_id_val)
+            return json.dumps({"count": len(records), "records": records}, default=str)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def get_odoo_fields(model: str) -> str:
+        """Get the field definitions (name, type, label, required) of an Odoo model."""
+        try:
+            fields = odoo.call(model, "fields_get", [], {"attributes": ["string", "type", "required", "readonly"]}, company_id=company_id_val)
+            return json.dumps(fields, default=str)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def find_odoo_models(query: str) -> str:
+        """Search installed Odoo models by technical name or label."""
+        try:
+            models_list = odoo.call("ir.model", "search_read", [[["model", "ilike", query]]], {"fields": ["model", "name"], "limit": 20}, company_id=company_id_val)
+            return json.dumps(models_list, default=str)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def execute_odoo_method(model: str, record_id: int, method: str) -> str:
+        """Execute a business method on a record, such as action_confirm or action_cancel on sale.order."""
+        try:
+            res = odoo.call(model, method, [[record_id]], company_id=company_id_val)
+            return json.dumps({"status": "success", "result": res}, default=str)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    # Initialize chat history
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = [
+            {"role": "assistant", "content": "Hello! I am your Odoo ERP assistant. You can ask me to search sales orders, look up products, check customers, or run actions on orders."}
+        ]
+
+    for msg in st.session_state["chat_messages"]:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    user_query = st.chat_input("E.g., 'Show me the last 5 sales orders', 'Check order S00327', 'Search products for Astro'")
+    if user_query:
+        st.session_state["chat_messages"].append({"role": "user", "content": user_query})
+        st.chat_message("user").write(user_query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking and querying Odoo..."):
+                try:
+                    ai_client = genai.Client(api_key=gemini_key)
+                    chat = ai_client.chats.create(
+                        model=gemini_model,
+                        config={
+                            "tools": [search_odoo_records, get_odoo_fields, find_odoo_models, execute_odoo_method],
+                            "system_instruction": (
+                                f"You are an expert Odoo ERP assistant connected to Kultiva and Alpha Mas Indo Odoo instance. "
+                                f"Current company context is ID: {company_id_val}. "
+                                f"Use the tools provided to query models like sale.order, res.partner, product.product, and ir.attachment. "
+                                f"Always format your replies cleanly with markdown tables and bullet points."
+                            )
+                        }
+                    )
+                    reply = chat.send_message(user_query)
+                    reply_text = reply.text
+                    st.write(reply_text)
+                    st.session_state["chat_messages"].append({"role": "assistant", "content": reply_text})
+                except Exception as e:
+                    err_msg = f"Error processing query: {e}"
+                    st.error(err_msg)
+                    st.session_state["chat_messages"].append({"role": "assistant", "content": err_msg})
+
+# ==============================================================================
+# TAB 3: ODOO RECORDS EXPLORER
+# ==============================================================================
+with tab_explorer:
+    st.subheader("🔍 Explore Odoo Records Directly")
+    
+    col_exp1, col_exp2, col_exp3 = st.columns([1, 1, 2])
+    with col_exp1:
+        explore_model = st.selectbox(
+            "Select Model",
+            ["sale.order (Sales Orders)", "res.partner (Customers / Vendors)", "product.product (Products)", "stock.picking (Deliveries)"]
+        )
+        model_name = explore_model.split(" ")[0]
+    with col_exp2:
+        exp_limit = st.slider("Record Limit", min_value=5, max_value=100, value=20, step=5)
+    with col_exp3:
+        search_filter = st.text_input("Filter by Name / Reference", placeholder="E.g. S003, Astro, Fore, Seastar...")
+
+    domain = []
+    if search_filter:
+        if model_name == "sale.order":
+            domain = ["|", ["name", "ilike", search_filter], ["client_order_ref", "ilike", search_filter]]
+        else:
+            domain = [["name", "ilike", search_filter]]
+
+    if st.button("🔄 Fetch Records from Odoo"):
+        with st.spinner("Fetching data from Odoo..."):
+            try:
+                field_map = {
+                    "sale.order": ["id", "name", "client_order_ref", "partner_id", "date_order", "amount_total", "state", "company_id"],
+                    "res.partner": ["id", "name", "email", "phone", "city", "customer_rank", "company_id"],
+                    "product.product": ["id", "name", "list_price", "barcode", "default_code", "sale_ok"],
+                    "stock.picking": ["id", "name", "partner_id", "state", "scheduled_date", "origin"]
+                }
+                records = odoo.search_read(
+                    model_name,
+                    domain=domain,
+                    fields=field_map.get(model_name),
+                    limit=exp_limit,
+                    order="id desc",
+                    company_id=company_id_val
+                )
+                if records:
+                    st.success(f"Found {len(records)} records in `{model_name}`:")
+                    st.dataframe(pd.DataFrame(records), use_container_width=True)
+                else:
+                    st.info("No records found matching the filter.")
+            except Exception as e:
+                st.error(f"Error fetching records: {e}")
