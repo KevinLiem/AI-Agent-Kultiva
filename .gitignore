@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Secrets & Environment variables
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Sample documents / PO test files (prevent leaking internal company invoices)
+*.pdf
+*.jpeg
+*.jpg
+*.png
+*.webp
+
+# Jupyter Notebooks & checkpoints
+*.ipynb
+.ipynb_checkpoints
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
