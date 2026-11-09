@@ -38,10 +38,8 @@ IMAGE_PATH = "ASTRO615194.pdf"
 def get_client_and_company(customer_name, items=None):
     """
     Determines company and client tag:
-    - Only Astro and Fore are in Alpha Mas Indo (Company ID 8).
+    - Astro and Fore are in Alpha Mas Indo (Company ID 8).
     - All other clients are in Kultiva Indonesia Makmur (Company ID 1).
-    - If customer_name was erroneously set to our own internal company (Alpha Mas Indo / Kultiva),
-      fallback to inspect line item descriptions.
     - Returns (company_id, company_name, client_tag)
     """
     name_upper = (customer_name or "").upper()
@@ -56,19 +54,31 @@ def get_client_and_company(customer_name, items=None):
                 return 8, "PT Alpha Mas Indo", "FORE"
             elif "SEASTAR" in combined_items:
                 return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
+            elif "KRACKLES" in combined_items or "TIBICOS" in combined_items:
+                return 1, "PT Kultiva Indonesia Makmur", "KRACKLES"
+            elif "BRUNEI" in combined_items or "SAHABAT" in combined_items:
+                return 1, "PT Kultiva Indonesia Makmur", "BRUNEI"
 
     if "ASTRO" in name_upper:
         return 8, "PT Alpha Mas Indo", "ASTRO"
-    elif "SEASTAR" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
     elif "FORE" in name_upper:
         return 8, "PT Alpha Mas Indo", "FORE"
-    elif "WOH" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "WOH"
-    elif "RAVA" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "RAVA"
+    elif "SEASTAR" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
     elif "SANGLA" in name_upper:
         return 1, "PT Kultiva Indonesia Makmur", "SANGLA"
+    elif "HEALTHY" in name_upper or "HLSG" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "HEALTHY LIVING"
+    elif "TIBICOS" in name_upper or "BODY ABSOLUTE" in name_upper or "KRACKLES" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "KRACKLES"
+    elif "BRUNEI" in name_upper or "SAHABAT" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "BRUNEI"
+    elif "EVIL" in name_upper or "EMBERZ" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "EVIL SNACKS"
+    elif "RAVA" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "RAVA"
+    elif "WOH" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "WOH"
     elif "SUNNANZ" in name_upper:
         return 1, "PT Kultiva Indonesia Makmur", "SUNNANZ"
     elif "EXOTIQUE" in name_upper:
@@ -293,7 +303,7 @@ def process_po_and_create_so(image_path=None, force_create=False):
     odoo_products = models.execute_kw(
         DB, uid, API_KEY,
         "product.product", "search_read",
-        [[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "]]],
+        [[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "], ["name", "not ilike", "Sticker "]]],
         {"fields": ["id", "name", "list_price", "barcode"], "context": odoo_context}
     )
 

@@ -133,19 +133,31 @@ def get_client_and_company(customer_name, items=None):
                 return 8, "PT Alpha Mas Indo", "FORE"
             elif "SEASTAR" in combined_items:
                 return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
+            elif "KRACKLES" in combined_items or "TIBICOS" in combined_items:
+                return 1, "PT Kultiva Indonesia Makmur", "KRACKLES"
+            elif "BRUNEI" in combined_items or "SAHABAT" in combined_items:
+                return 1, "PT Kultiva Indonesia Makmur", "BRUNEI"
 
     if "ASTRO" in name_upper:
         return 8, "PT Alpha Mas Indo", "ASTRO"
-    elif "SEASTAR" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
     elif "FORE" in name_upper:
         return 8, "PT Alpha Mas Indo", "FORE"
-    elif "WOH" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "WOH"
-    elif "RAVA" in name_upper:
-        return 1, "PT Kultiva Indonesia Makmur", "RAVA"
+    elif "SEASTAR" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "SEASTAR"
     elif "SANGLA" in name_upper:
         return 1, "PT Kultiva Indonesia Makmur", "SANGLA"
+    elif "HEALTHY" in name_upper or "HLSG" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "HEALTHY LIVING"
+    elif "TIBICOS" in name_upper or "BODY ABSOLUTE" in name_upper or "KRACKLES" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "KRACKLES"
+    elif "BRUNEI" in name_upper or "SAHABAT" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "BRUNEI"
+    elif "EVIL" in name_upper or "EMBERZ" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "EVIL SNACKS"
+    elif "RAVA" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "RAVA"
+    elif "WOH" in name_upper:
+        return 1, "PT Kultiva Indonesia Makmur", "WOH"
     elif "SUNNANZ" in name_upper:
         return 1, "PT Kultiva Indonesia Makmur", "SUNNANZ"
     elif "EXOTIQUE" in name_upper:
@@ -321,7 +333,7 @@ if uploaded_file is not None:
                 odoo_products = models.execute_kw(
                     DB, uid, api_key,
                     "product.product", "search_read",
-                    [[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "]]],
+                    [[["sale_ok", "=", True], ["name", "not ilike", "Pouch "], ["name", "not ilike", "Box "], ["name", "not ilike", "Sticker "]]],
                     {"fields": ["id", "name", "list_price", "barcode"], "context": odoo_context}
                 )
                 
