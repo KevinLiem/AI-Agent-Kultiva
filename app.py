@@ -192,6 +192,11 @@ def get_odoo_client(url, db, user, key):
 
 odoo = get_odoo_client(odoo_url, odoo_db, odoo_user, odoo_api_key)
 
+# Initialize editor session state defaults
+for _k in ("so_editor_found", "so_editor_order", "so_editor_lines", "so_editor_company_id"):
+    if _k not in st.session_state:
+        st.session_state[_k] = None
+
 # --- PO EXTRACTION SCHEMA ---
 class PurchaseOrderItem(BaseModel):
     kode_barang: str = Field(default="", description="Barcode or item code, if available")
@@ -326,10 +331,11 @@ st.markdown('<div class="main-header">🚀 Kultiva & Alpha Mas Indo — Odoo AI 
 st.markdown('<div class="sub-header">Automated PO to Sales Order Processing • Odoo External API Integration • Interactive ERP Chat Agent</div>', unsafe_allow_html=True)
 
 # TABS INTERFACE
-tab_po, tab_assistant, tab_explorer = st.tabs([
+tab_po, tab_assistant, tab_explorer, tab_editor = st.tabs([
     "📄 Purchase Order AI Agent",
     "💬 Odoo Natural Language Assistant",
-    "🔍 Odoo Records Explorer"
+    "🔍 Odoo Records Explorer",
+    "✏️ Edit Sales Order"
 ])
 
 # ==============================================================================
@@ -864,3 +870,423 @@ with tab_explorer:
                     st.info("No records found matching the filter.")
             except Exception as e:
                 st.error(f"Error fetching records: {e}")
+
+
+# ==============================================================================
+# TAB 4: SALES ORDER EDITOR
+# ==============================================================================
+with tab_editor:
+    st.subheader("✏️ Edit Existing Sales Order")
+    st.caption(
+        "Find a Sales Order by its Odoo reference (e.g. S00123) or customer PO number (e.g. P00478), "
+        "then remove or modify line items directly."
+    )
+
+    # ── Search Section ────────────────────────────────────────────────────────
+    ed_col1, ed_col2, ed_col3 = st.columns([2, 1, 1])
+    with ed_col1:
+        so_search_term = st.text_input(
+            "Order Reference / Customer PO Number",
+            placeholder="e.g. P00478 or S00327",
+            key="so_search_term"
+        )
+    with ed_col2:
+        so_search_company = st.selectbox(
+            "Search in Company",
+            ["Both Companies", "PT Alpha Mas Indo (ID: 8)", "PT Kultiva Indonesia Makmur (ID: 1)"],
+            key="so_search_company"
+        )
+    with ed_col3:
+        st.write("")
+        st.write("")
+        search_so_btn = st.button("🔎 Find Sales Order", type="primary", use_container_width=True, key="search_so_btn")
+
+    if search_so_btn and so_search_term:
+        st.session_state.pop("so_editor_order", None)
+        st.session_state.pop("so_editor_lines", None)
+        with st.spinner(f"Searching Odoo for '{so_search_term}'..."):
+            try:
+                search_domain = [
+                    "|",
+                    ["name", "ilike", so_search_term],
+                    ["client_order_ref", "ilike", so_search_term]
+                ]
+                so_fields = ["id", "name", "client_order_ref", "partner_id", "date_order",
+                             "amount_total", "state", "company_id", "order_line"]
+
+                found_orders = []
+                companies_to_search = []
+                if "Alpha Mas" in so_search_company:
+                    companies_to_search = [8]
+                elif "Kultiva" in so_search_company:
+                    companies_to_search = [1]
+                else:
+                    companies_to_search = [8, 1]
+
+                for cid in companies_to_search:
+                    results = odoo.search_read(
+                        "sale.order",
+                        domain=search_domain,
+                        fields=so_fields,
+                        limit=10,
+                        order="id desc",
+                        company_id=cid
+                    )
+                    for r in results:
+                        r["_search_company_id"] = cid
+                    found_orders.extend(results)
+
+                # De-duplicate by id
+                seen_ids = set()
+                unique_orders = []
+                for o in found_orders:
+                    if o["id"] not in seen_ids:
+                        seen_ids.add(o["id"])
+                        unique_orders.append(o)
+
+                if unique_orders:
+                    st.session_state["so_editor_found"] = unique_orders
+                    st.success(f"Found {len(unique_orders)} order(s).")
+                else:
+                    st.session_state["so_editor_found"] = []
+                    st.warning(f"No Sales Order found matching '{so_search_term}' in Odoo.")
+
+            except Exception as e:
+                st.error(f"Error searching Odoo: {e}")
+
+    # ── Order Selection ───────────────────────────────────────────────────────
+    if st.session_state.get("so_editor_found"):
+        found_orders = st.session_state["so_editor_found"]
+
+        order_options = {
+            f"{o['name']}  |  PO: {o.get('client_order_ref') or '—'}  |  "
+            f"Customer: {o['partner_id'][1] if o.get('partner_id') else '—'}  |  "
+            f"Status: {o['state']}  |  "
+            f"Company: {o['company_id'][1] if o.get('company_id') else '?'}": o
+            for o in found_orders
+        }
+        selected_label = st.selectbox(
+            "Select Sales Order to Edit",
+            list(order_options.keys()),
+            key="so_editor_select"
+        )
+        selected_order = order_options[selected_label]
+
+        load_lines_btn = st.button(
+            f"📂 Load Line Items for {selected_order['name']}",
+            use_container_width=True,
+            key="load_lines_btn"
+        )
+
+        if load_lines_btn:
+            with st.spinner("Loading order lines from Odoo..."):
+                try:
+                    so_company_id = (
+                        selected_order["company_id"][0]
+                        if selected_order.get("company_id") else
+                        selected_order.get("_search_company_id", 1)
+                    )
+                    line_ids = selected_order.get("order_line", [])
+                    if not line_ids:
+                        st.info("This Sales Order has no line items.")
+                    else:
+                        lines = odoo.call(
+                            "sale.order.line", "read",
+                            [line_ids],
+                            {"fields": ["id", "product_id", "name", "product_uom_qty",
+                                        "price_unit", "price_subtotal", "state"]},
+                            company_id=so_company_id
+                        )
+                        st.session_state["so_editor_order"] = selected_order
+                        st.session_state["so_editor_lines"] = lines
+                        st.session_state["so_editor_company_id"] = so_company_id
+                except Exception as e:
+                    st.error(f"Error loading order lines: {e}")
+
+    # ── Line Item Editor ──────────────────────────────────────────────────────
+    if st.session_state.get("so_editor_lines") is not None:
+        order = st.session_state["so_editor_order"]
+        lines = st.session_state["so_editor_lines"]
+        so_company_id = st.session_state.get("so_editor_company_id", 1)
+
+        st.divider()
+        st.subheader(f"📋 Line Items — {order['name']}")
+
+        # Order summary
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Order No.", order["name"])
+        m2.metric("Customer PO Ref", order.get("client_order_ref") or "—")
+        m3.metric("Status", order["state"])
+        m4.metric("Total", f"Rp {order.get('amount_total', 0):,.0f}")
+
+        # State warning
+        order_state = order.get("state", "draft")
+        if order_state == "sale":
+            st.warning(
+                "⚠️ This order is **confirmed** (`sale`). "
+                "It will be **reset to draft** automatically before removing lines, then re-confirmed."
+            )
+        elif order_state == "done":
+            st.error("❌ This order is **locked/done** and cannot be edited.")
+        elif order_state == "cancel":
+            st.error("❌ This order is **cancelled** and cannot be edited.")
+
+        # Build line table with checkboxes
+        st.write("**Select lines to REMOVE:**")
+
+        line_rows = []
+        for ln in lines:
+            prod_name = ln["product_id"][1] if ln.get("product_id") else ln.get("name", "—")
+            line_rows.append({
+                "ID": ln["id"],
+                "Product": prod_name,
+                "Description": ln.get("name", ""),
+                "Qty": ln.get("product_uom_qty", 0),
+                "Unit Price": f"Rp {ln.get('price_unit', 0):,.0f}",
+                "Subtotal": f"Rp {ln.get('price_subtotal', 0):,.0f}",
+            })
+
+        df_lines = pd.DataFrame(line_rows)
+
+        # Use multiselect for line removal
+        line_display_opts = {
+            f"[ID:{row['ID']}] {row['Product']}  (Qty: {row['Qty']})": row["ID"]
+            for row in line_rows
+        }
+        lines_to_remove_labels = st.multiselect(
+            "Lines to Remove (select one or more):",
+            list(line_display_opts.keys()),
+            key="lines_to_remove_select"
+        )
+        lines_to_remove_ids = [line_display_opts[lbl] for lbl in lines_to_remove_labels]
+
+        # Show current line table
+        st.dataframe(df_lines.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+
+        if lines_to_remove_ids:
+            st.warning(f"⚠️ You are about to **permanently delete {len(lines_to_remove_ids)} line(s)** from {order['name']}. This cannot be undone.")
+
+            remove_btn = st.button(
+                f"🗑️ Remove {len(lines_to_remove_ids)} Selected Line(s) from {order['name']}",
+                type="primary",
+                use_container_width=True,
+                key="remove_lines_btn"
+            )
+
+            if remove_btn:
+                if order_state in ("done", "cancel"):
+                    st.error("Cannot edit a done or cancelled order.")
+                else:
+                    with st.spinner("Removing line items from Odoo..."):
+                        try:
+                            # If confirmed, reset to draft first
+                            if order_state == "sale":
+                                st.info("Resetting order to draft...")
+                                odoo.call(
+                                    "sale.order", "action_cancel",
+                                    [[order["id"]]],
+                                    company_id=so_company_id
+                                )
+                                odoo.call(
+                                    "sale.order", "action_draft",
+                                    [[order["id"]]],
+                                    company_id=so_company_id
+                                )
+
+                            # Delete the selected lines
+                            odoo.call(
+                                "sale.order.line", "unlink",
+                                [lines_to_remove_ids],
+                                company_id=so_company_id
+                            )
+
+                            # Re-confirm if it was confirmed before
+                            if order_state == "sale":
+                                st.info("Re-confirming order...")
+                                odoo.call(
+                                    "sale.order", "action_confirm",
+                                    [[order["id"]]],
+                                    company_id=so_company_id
+                                )
+
+                            st.success(f"✅ Successfully removed {len(lines_to_remove_ids)} line(s) from {order['name']}!")
+
+                            # Reload the updated lines
+                            updated_order = odoo.search_read(
+                                "sale.order",
+                                domain=[["id", "=", order["id"]]],
+                                fields=["id", "name", "client_order_ref", "partner_id", "date_order",
+                                        "amount_total", "state", "company_id", "order_line"],
+                                limit=1,
+                                company_id=so_company_id
+                            )
+                            if updated_order:
+                                updated_line_ids = updated_order[0].get("order_line", [])
+                                if updated_line_ids:
+                                    updated_lines = odoo.call(
+                                        "sale.order.line", "read",
+                                        [updated_line_ids],
+                                        {"fields": ["id", "product_id", "name", "product_uom_qty",
+                                                    "price_unit", "price_subtotal", "state"]},
+                                        company_id=so_company_id
+                                    )
+                                else:
+                                    updated_lines = []
+                                st.session_state["so_editor_order"] = updated_order[0]
+                                st.session_state["so_editor_lines"] = updated_lines
+                                st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error removing lines: {e}")
+        else:
+            st.info("Select one or more lines above to enable the remove button.")
+
+        # ── Quick Remove by Product Name ──────────────────────────────────────
+        st.divider()
+        with st.expander("🔍 Quick Remove by Product Name (keyword match)"):
+            st.caption("Type keywords to auto-select matching lines. Useful for removing by product name fragments.")
+            keyword_input = st.text_input(
+                "Product name keywords (comma-separated)",
+                placeholder="e.g. Tempe BBQ, Banana Seasalt, Non GMO",
+                key="quick_remove_keywords"
+            )
+            if keyword_input:
+                keywords = [k.strip().lower() for k in keyword_input.split(",") if k.strip()]
+                matched_lines = []
+                for ln in lines:
+                    prod_name = (ln["product_id"][1] if ln.get("product_id") else ln.get("name", "")).lower()
+                    desc = ln.get("name", "").lower()
+                    if any(kw in prod_name or kw in desc for kw in keywords):
+                        matched_lines.append(ln)
+
+                if matched_lines:
+                    st.write(f"**{len(matched_lines)} line(s) matched:**")
+                    for ml in matched_lines:
+                        pname = ml["product_id"][1] if ml.get("product_id") else ml.get("name", "—")
+                        st.markdown(f"- `[ID:{ml['id']}]` **{pname}** — Qty: {ml.get('product_uom_qty', 0)}")
+
+                    if order_state not in ("done", "cancel"):
+                        quick_remove_btn = st.button(
+                            f"🗑️ Remove These {len(matched_lines)} Matched Line(s)",
+                            type="primary",
+                            key="quick_remove_btn"
+                        )
+                        if quick_remove_btn:
+                            matched_ids = [ml["id"] for ml in matched_lines]
+                            with st.spinner("Removing matched lines..."):
+                                try:
+                                    if order_state == "sale":
+                                        odoo.call("sale.order", "action_cancel", [[order["id"]]], company_id=so_company_id)
+                                        odoo.call("sale.order", "action_draft", [[order["id"]]], company_id=so_company_id)
+
+                                    odoo.call("sale.order.line", "unlink", [matched_ids], company_id=so_company_id)
+
+                                    if order_state == "sale":
+                                        odoo.call("sale.order", "action_confirm", [[order["id"]]], company_id=so_company_id)
+
+                                    st.success(f"✅ Removed {len(matched_ids)} line(s) successfully!")
+
+                                    # Reload
+                                    updated_order = odoo.search_read(
+                                        "sale.order",
+                                        domain=[["id", "=", order["id"]]],
+                                        fields=["id", "name", "client_order_ref", "partner_id", "date_order",
+                                                "amount_total", "state", "company_id", "order_line"],
+                                        limit=1,
+                                        company_id=so_company_id
+                                    )
+                                    if updated_order:
+                                        updated_line_ids = updated_order[0].get("order_line", [])
+                                        updated_lines = odoo.call(
+                                            "sale.order.line", "read",
+                                            [updated_line_ids],
+                                            {"fields": ["id", "product_id", "name", "product_uom_qty",
+                                                        "price_unit", "price_subtotal", "state"]},
+                                            company_id=so_company_id
+                                        ) if updated_line_ids else []
+                                        st.session_state["so_editor_order"] = updated_order[0]
+                                        st.session_state["so_editor_lines"] = updated_lines
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                    else:
+                        st.error("Order is in done/cancelled state — cannot edit.")
+                else:
+                    st.info("No lines matched those keywords.")
+
+        # ── Add Line Item ──────────────────────────────────────────────────────
+        st.divider()
+        with st.expander("➕ Add a New Line Item to this Order"):
+            if order_state in ("done", "cancel"):
+                st.error("Cannot add lines to a done or cancelled order.")
+            else:
+                add_col1, add_col2, add_col3 = st.columns([3, 1, 1])
+                with add_col1:
+                    new_product_search = st.text_input("Search Product by Name", key="add_line_product_search")
+                with add_col2:
+                    new_qty = st.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, key="add_line_qty")
+                with add_col3:
+                    new_price = st.number_input("Unit Price (Rp)", min_value=0.0, value=0.0, step=100.0, key="add_line_price")
+
+                if new_product_search:
+                    with st.spinner("Searching products..."):
+                        try:
+                            prod_results = odoo.search_read(
+                                "product.product",
+                                domain=[["sale_ok", "=", True], ["name", "ilike", new_product_search]],
+                                fields=["id", "name", "list_price"],
+                                limit=10,
+                                company_id=so_company_id
+                            )
+                            if prod_results:
+                                prod_map = {f"[{p['id']}] {p['name']} (Rp {p['list_price']:,.0f})": p for p in prod_results}
+                                selected_prod_label = st.selectbox("Select Product", list(prod_map.keys()), key="add_line_prod_select")
+                                selected_prod = prod_map[selected_prod_label]
+
+                                if st.button("➕ Add Line to Order", type="primary", key="add_line_btn"):
+                                    with st.spinner("Adding line to order..."):
+                                        try:
+                                            price_to_use = new_price if new_price > 0 else selected_prod["list_price"]
+                                            if order_state == "sale":
+                                                odoo.call("sale.order", "action_cancel", [[order["id"]]], company_id=so_company_id)
+                                                odoo.call("sale.order", "action_draft", [[order["id"]]], company_id=so_company_id)
+
+                                            odoo.call("sale.order.line", "create", [{
+                                                "order_id": order["id"],
+                                                "product_id": selected_prod["id"],
+                                                "name": selected_prod["name"],
+                                                "product_uom_qty": new_qty,
+                                                "price_unit": price_to_use,
+                                            }], company_id=so_company_id)
+
+                                            if order_state == "sale":
+                                                odoo.call("sale.order", "action_confirm", [[order["id"]]], company_id=so_company_id)
+
+                                            st.success(f"✅ Added {new_qty}x {selected_prod['name']} to {order['name']}!")
+                                            # Reload
+                                            updated_order = odoo.search_read(
+                                                "sale.order",
+                                                domain=[["id", "=", order["id"]]],
+                                                fields=["id", "name", "client_order_ref", "partner_id", "date_order",
+                                                        "amount_total", "state", "company_id", "order_line"],
+                                                limit=1,
+                                                company_id=so_company_id
+                                            )
+                                            if updated_order:
+                                                updated_line_ids = updated_order[0].get("order_line", [])
+                                                updated_lines = odoo.call(
+                                                    "sale.order.line", "read",
+                                                    [updated_line_ids],
+                                                    {"fields": ["id", "product_id", "name", "product_uom_qty",
+                                                                "price_unit", "price_subtotal", "state"]},
+                                                    company_id=so_company_id
+                                                ) if updated_line_ids else []
+                                                st.session_state["so_editor_order"] = updated_order[0]
+                                                st.session_state["so_editor_lines"] = updated_lines
+                                                st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error adding line: {e}")
+                            else:
+                                st.info("No products found. Try a different search term.")
+                        except Exception as e:
+                            st.error(f"Error searching products: {e}")
