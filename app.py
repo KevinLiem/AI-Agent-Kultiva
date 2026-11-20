@@ -5,6 +5,7 @@ import json
 import base64
 import mimetypes
 import xmlrpc.client
+import urllib.request
 from datetime import datetime
 import streamlit as st
 import pandas as pd
@@ -91,6 +92,44 @@ DEFAULT_ODOO_USER = get_config("ODOO_USERNAME", "ppicjkt@kultivaco.com")
 DEFAULT_ODOO_KEY = get_config("ODOO_API_KEY", _DEF_ODOO_KEY)
 DEFAULT_GEMINI_KEY = get_config("GEMINI_API_KEY", _DEF_GEM_KEY)
 DEFAULT_CLAUDE_KEY = get_config("ANTHROPIC_API_KEY", "")
+
+# --- CURRENCY CONVERSION HELPER ---
+def get_exchange_rate_to_idr(from_currency: str, date_str: str) -> tuple[float, str]:
+    curr = (from_currency or "").upper().strip()
+    if not curr or curr in ("IDR", "RP", "RUPIAH"):
+        return 1.0, "1:1 (Base IDR)"
+    date_clean = re.sub(r"[^\d\-]", "", date_str.strip())[:10]
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_clean):
+        date_clean = datetime.today().strftime("%Y-%m-%d")
+
+    # 1. Historical rate from Frankfurter API
+    for host in ["api.frankfurter.dev/v1", "api.frankfurter.app"]:
+        try:
+            url = f"https://{host}/{date_clean}?from={curr}&to=IDR"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                rate = float(data.get("rates", {}).get("IDR", 0))
+                if rate > 0:
+                    act_date = data.get("date", date_clean)
+                    return rate, f"Market Average on {act_date} ({host})"
+        except Exception:
+            pass
+
+    # 2. Latest rate fallback from open.er-api.com
+    try:
+        url = f"https://open.er-api.com/v6/latest/{curr}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            rate = float(data.get("rates", {}).get("IDR", 0))
+            if rate > 0:
+                return rate, "Latest Market Rate (Open Exchange)"
+    except Exception:
+        pass
+
+    fallback_map = {"USD": 16500.0, "EUR": 17800.0, "SGD": 12500.0, "AUD": 10800.0}
+    return fallback_map.get(curr, 1.0), "Standard Fallback"
 
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
@@ -822,8 +861,41 @@ with tab_invoice:
             with c_ed7:
                 edit_notes = st.text_input("Notes / Keterangan", value=inv_data.get("notes") or "", placeholder="Remarks or expense category", key="edit_inv_notes")
 
+            # --- CURRENCY CONVERSION ACCORDING TO INVOICE DATE ---
+            is_foreign_currency = edit_currency.upper() not in ("IDR", "RP", "RUPIAH")
+            convert_to_idr = False
+            exchange_rate = 1.0
+            rate_info_str = "1:1 (IDR Base)"
+
+            if is_foreign_currency:
+                st.markdown("#### 💱 Currency Conversion to Indonesian Rupiah (IDR)")
+                def_rate, def_src = get_exchange_rate_to_idr(edit_currency, edit_date)
+                c_curr1, c_curr2, c_curr3 = st.columns([2, 2, 2])
+                with c_curr1:
+                    convert_to_idr = st.checkbox(
+                        f"Convert {edit_currency} to Rupiah (IDR)",
+                        value=True,
+                        key="inv_convert_to_idr",
+                        help="Converts bill amounts and product standard prices to Rupiah (IDR) based on the invoice date's daily average rate."
+                    )
+                with c_curr2:
+                    exchange_rate = st.number_input(
+                        f"Kurs 1 {edit_currency} ➔ IDR ({edit_date})",
+                        value=float(def_rate),
+                        min_value=1.0,
+                        step=10.0,
+                        format="%.2f",
+                        key="inv_custom_rate",
+                        help=f"Source: {def_src}"
+                    )
+                with c_curr3:
+                    st.caption(f"**Rate Source:** {def_src}")
+                    if convert_to_idr:
+                        rate_info_str = f"Converted @ Kurs Rp {exchange_rate:,.2f}/{edit_currency} (Date: {edit_date})"
+                        st.info(f"💡 All line items & products will be booked in **Rupiah (IDR)** at **Rp {exchange_rate:,.2f}**.")
+
             # Editable Line Items Table
-            st.write("**Line Items (Editable Table):**")
+            st.write(f"**Line Items ({'Original ' + edit_currency if is_foreign_currency else 'IDR'}):**")
             raw_items = inv_data.get("items", [])
             initial_rows = []
             for it in raw_items:
@@ -847,8 +919,8 @@ with tab_invoice:
                 column_config={
                     "Description": st.column_config.TextColumn("Description / Uraian", required=True, width="large"),
                     "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.01, step=1.0, required=True),
-                    "Unit Price": st.column_config.NumberColumn("Unit Price", min_value=0.0, step=100.0, required=True),
-                    "Subtotal": st.column_config.NumberColumn("Subtotal", disabled=True),
+                    "Unit Price": st.column_config.NumberColumn(f"Unit Price ({edit_currency})", min_value=0.0, step=10.0, required=True),
+                    "Subtotal": st.column_config.NumberColumn(f"Subtotal ({edit_currency})", disabled=True),
                 }
             )
 
@@ -862,11 +934,41 @@ with tab_invoice:
                     price = float(r.get("Unit Price") or 0.0)
                     sub = qty * price
                     calculated_grand_total += sub
-                    valid_lines.append({"description": desc, "quantity": qty, "unit_price": price, "subtotal": sub})
+
+                    # Converted prices
+                    price_booked = price * exchange_rate if convert_to_idr else price
+                    sub_booked = qty * price_booked
+                    valid_lines.append({
+                        "description": desc,
+                        "quantity": qty,
+                        "unit_price_orig": price,
+                        "unit_price_booked": price_booked,
+                        "subtotal_orig": sub,
+                        "subtotal_booked": sub_booked
+                    })
+
+            grand_total_booked = sum(l["subtotal_booked"] for l in valid_lines)
 
             c_gt1, c_gt2 = st.columns([3, 1])
             with c_gt2:
-                st.metric("Total Invoice Amount", f"{edit_currency} {calculated_grand_total:,.2f}")
+                if convert_to_idr:
+                    st.metric("Total in Rupiah (IDR)", f"Rp {grand_total_booked:,.2f}", delta=f"Orig: {edit_currency} {calculated_grand_total:,.2f} @ Rp {exchange_rate:,.2f}")
+                else:
+                    st.metric("Total Invoice Amount", f"{edit_currency} {calculated_grand_total:,.2f}")
+
+            # Show explicit IDR Conversion Breakdown table if foreign currency
+            if is_foreign_currency and convert_to_idr:
+                st.markdown("##### 💵 Converted Line Items in Rupiah (IDR):")
+                conv_display_rows = []
+                for idx, ln in enumerate(valid_lines, 1):
+                    conv_display_rows.append({
+                        "Item": ln["description"],
+                        "Qty": f"{ln['quantity']:,.2f}",
+                        f"Unit Price ({edit_currency})": f"{edit_currency} {ln['unit_price_orig']:,.2f}",
+                        "Unit Price (IDR)": f"Rp {ln['unit_price_booked']:,.2f}",
+                        "Subtotal (IDR)": f"Rp {ln['subtotal_booked']:,.2f}",
+                    })
+                st.dataframe(pd.DataFrame(conv_display_rows), use_container_width=True, hide_index=True)
 
             # --- LIVE ODOO PRE-SUBMISSION STATUS ---
             st.divider()
@@ -903,9 +1005,10 @@ with tab_invoice:
                         else:
                             new_prods += 1
 
+                    booking_curr_name = "Indonesian Rupiah (IDR)" if convert_to_idr else edit_currency
                     st.markdown(f"""
-                    - **Products Check:** `{matched_prods}` existing product(s) matched | `{new_prods}` new product/service(s) will be created automatically.
-                    - **Currency:** `{edit_currency}`
+                    - **Products Check:** `{matched_prods}` existing product(s) matched | `{new_prods}` new product/service(s) will be created automatically in Odoo.
+                    - **Booking Currency:** `{booking_curr_name}` ({rate_info_str})
                     - **Target Company:** `{inv_target_company}`
                     """)
 
@@ -926,7 +1029,7 @@ with tab_invoice:
                                     p_vals["customer_rank"] = 1
                                 final_partner_id = odoo.call("res.partner", "create", [p_vals], company_id=inv_company_id)
 
-                            # B. Get or Create Products for each line
+                            # B. Get or Create Products for each line (Auto-add new product if not found!)
                             move_lines_payload = []
                             for line in valid_lines:
                                 p_search = odoo.search_read(
@@ -939,39 +1042,49 @@ with tab_invoice:
                                 if p_search:
                                     prod_id = p_search[0]["id"]
                                 else:
-                                    # Create new product / service
+                                    # Create new product / service with price in IDR
                                     new_prod_vals = {
                                         "name": line["description"],
                                         "type": "service",
                                         "purchase_ok": True,
                                         "sale_ok": False,
-                                        "standard_price": float(line["unit_price"]),
+                                        "standard_price": float(line["unit_price_booked"]),
                                         "company_id": inv_company_id,
                                     }
                                     prod_id = odoo.call("product.product", "create", [new_prod_vals], company_id=inv_company_id)
 
+                                # Format line description to record original currency if converted
+                                if convert_to_idr:
+                                    line_desc = f"{line['description']} [Orig: {edit_currency} {line['unit_price_orig']:,.2f} @ Kurs Rp {exchange_rate:,.2f}]"
+                                else:
+                                    line_desc = line["description"]
+
                                 move_lines_payload.append((0, 0, {
                                     "product_id": prod_id,
-                                    "name": line["description"],
+                                    "name": line_desc,
                                     "quantity": float(line["quantity"]),
-                                    "price_unit": float(line["unit_price"]),
+                                    "price_unit": float(line["unit_price_booked"]),
                                 }))
 
-                            # C. Currency handling
+                            # C. Currency handling (if not converted to IDR, set foreign currency in Odoo)
                             currency_id = None
-                            if edit_currency and edit_currency.upper() not in ("IDR", "RP"):
+                            if not convert_to_idr and is_foreign_currency:
                                 c_recs = odoo.search_read("res.currency", domain=[["name", "=", edit_currency.upper()]], fields=["id"], limit=1)
                                 if c_recs:
                                     currency_id = c_recs[0]["id"]
 
                             # D. Create account.move
+                            narration_text = edit_notes.strip() or f"Bukti Kas Keluar - {edit_partner.strip()}"
+                            if convert_to_idr:
+                                narration_text += f" | Kurs: 1 {edit_currency} = Rp {exchange_rate:,.2f} on {edit_date} (Orig Total: {edit_currency} {calculated_grand_total:,.2f})"
+
                             move_vals = {
                                 "move_type": chosen_move_type,
                                 "partner_id": final_partner_id,
                                 "invoice_date": edit_date.strip(),
                                 "company_id": inv_company_id,
                                 "ref": edit_ref.strip() or f"VOUCHER-{edit_date.strip()}",
-                                "narration": edit_notes.strip() or f"Bukti Kas Keluar - {edit_partner.strip()}",
+                                "narration": narration_text,
                                 "invoice_line_ids": move_lines_payload,
                             }
                             if currency_id:
@@ -1010,13 +1123,14 @@ with tab_invoice:
                                 company_id=inv_company_id
                             )[0]
 
+                            display_total_currency = "Rp" if convert_to_idr else edit_currency
                             st.balloons()
                             st.success("🎉 **Invoice / Vendor Bill Entered Successfully into Odoo Accounting!**")
                             st.markdown(f"""
                             - **Bill Reference / Name:** `{move_info.get('name') or '(Draft)'}` (ID: `{created_move_id}`)
                             - **Status:** `{move_info.get('state')}`
                             - **Company:** `{move_info.get('company_id')[1] if move_info.get('company_id') else inv_target_company}`
-                            - **Total Amount:** **{edit_currency} {move_info.get('amount_total', calculated_grand_total):,.2f}**
+                            - **Total Booked:** **{display_total_currency} {move_info.get('amount_total', grand_total_booked):,.2f}**
                             - **Vendor:** `{edit_partner}` (ID: `{final_partner_id}`)
                             - **Document:** Original picture permanently attached to the bill in Odoo.
                             """)

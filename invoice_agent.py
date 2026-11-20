@@ -24,6 +24,7 @@ import base64
 import argparse
 import mimetypes
 import xmlrpc.client
+import urllib.request
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -59,6 +60,44 @@ ODOO_USER = os.getenv("ODOO_USERNAME", "ppicjkt@kultivaco.com")
 ODOO_KEY = os.getenv("ODOO_API_KEY", _DEF_ODOO_KEY)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", _DEF_GEM_KEY)
 CLAUDE_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# --- CURRENCY CONVERSION TO IDR HELPER ---
+def get_exchange_rate_to_idr(from_currency: str, date_str: str) -> tuple[float, str]:
+    curr = (from_currency or "").upper().strip()
+    if not curr or curr in ("IDR", "RP", "RUPIAH"):
+        return 1.0, "1:1 (Base IDR)"
+    date_clean = re.sub(r"[^\d\-]", "", date_str.strip())[:10]
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_clean):
+        date_clean = datetime.today().strftime("%Y-%m-%d")
+
+    # 1. Historical rate from Frankfurter API
+    for host in ["api.frankfurter.dev/v1", "api.frankfurter.app"]:
+        try:
+            url = f"https://{host}/{date_clean}?from={curr}&to=IDR"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                rate = float(data.get("rates", {}).get("IDR", 0))
+                if rate > 0:
+                    act_date = data.get("date", date_clean)
+                    return rate, f"Frankfurter Market Rate on {act_date} ({host})"
+        except Exception:
+            pass
+
+    # 2. Latest rate fallback from open.er-api.com
+    try:
+        url = f"https://open.er-api.com/v6/latest/{curr}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            rate = float(data.get("rates", {}).get("IDR", 0))
+            if rate > 0:
+                return rate, "Open Exchange Rates API"
+    except Exception:
+        pass
+
+    fallback_map = {"USD": 16500.0, "EUR": 17800.0, "SGD": 12500.0, "AUD": 10800.0}
+    return fallback_map.get(curr, 1.0), "Standard Fallback"
 
 # --- PYDANTIC EXTRACTION SCHEMA ---
 class InvoiceLineItem(BaseModel):
@@ -260,7 +299,7 @@ class OdooAccountingAgent:
         return curr_ids[0] if curr_ids else None
 
     # 4. Create Account Move (Vendor Bill / Customer Invoice)
-    def create_invoice_move(self, invoice_data: InvoiceData, image_path: str, auto_post: bool = False):
+    def create_invoice_move(self, invoice_data: InvoiceData, image_path: str, auto_post: bool = False, convert_to_idr: bool = True):
         print(f"\n[1/4] Checking/Creating Partner in Odoo...")
         is_supplier = (invoice_data.invoice_type == "in_invoice")
         partner_id, partner_created = self.get_or_create_partner(invoice_data.partner_name, is_supplier=is_supplier)
@@ -269,25 +308,52 @@ class OdooAccountingAgent:
         else:
             print(f"  ✓ Found existing vendor: '{invoice_data.partner_name}' (ID: {partner_id})")
 
+        # Currency conversion calculation
+        is_foreign = (invoice_data.currency or "").upper() not in ("IDR", "RP", "RUPIAH")
+        rate = 1.0
+        rate_source = "1:1"
+        if is_foreign and convert_to_idr:
+            rate, rate_source = get_exchange_rate_to_idr(invoice_data.currency, invoice_data.invoice_date)
+            print(f"\n💱 Currency Conversion to Rupiah (IDR):")
+            print(f"  • Date: {invoice_data.invoice_date}")
+            print(f"  • Rate: 1 {invoice_data.currency} = Rp {rate:,.2f} ({rate_source})")
+
         print(f"\n[2/4] Mapping & Auto-Creating Products/Services in Odoo...")
         invoice_lines_payload = []
+        total_booked_idr = 0.0
         for idx, item in enumerate(invoice_data.items, 1):
-            product_id, prod_created = self.get_or_create_product(item.description, unit_price=item.unit_price)
+            if is_foreign and convert_to_idr:
+                unit_price_booked = float(item.unit_price) * rate
+                line_name = f"{item.description} [Orig: {invoice_data.currency} {item.unit_price:,.2f} @ Kurs Rp {rate:,.2f}]"
+            else:
+                unit_price_booked = float(item.unit_price)
+                line_name = item.description
+
+            total_booked_idr += float(item.quantity or 1.0) * unit_price_booked
+
+            # Product auto-create if not found: standard_price in IDR
+            product_id, prod_created = self.get_or_create_product(item.description, unit_price=unit_price_booked)
             if prod_created:
-                print(f"  ✨ Line {idx}: CREATED NEW PRODUCT/SERVICE: '{item.description}' (ID: {product_id})")
+                print(f"  ✨ Line {idx}: CREATED NEW PRODUCT/SERVICE: '{item.description}' (ID: {product_id}, Std Price: Rp {unit_price_booked:,.2f})")
             else:
                 print(f"  ✓ Line {idx}: Matched existing product: '{item.description}' (ID: {product_id})")
 
             line_vals = {
                 "product_id": product_id,
-                "name": item.description,
+                "name": line_name,
                 "quantity": float(item.quantity or 1.0),
-                "price_unit": float(item.unit_price),
+                "price_unit": unit_price_booked,
             }
             invoice_lines_payload.append((0, 0, line_vals))
 
         print(f"\n[3/4] Creating Accounting Entry (account.move)...")
-        currency_id = self.resolve_currency_id(invoice_data.currency)
+        currency_id = None
+        if not convert_to_idr and is_foreign:
+            currency_id = self.resolve_currency_id(invoice_data.currency)
+
+        narration = invoice_data.notes or f"Bukti Kas Keluar - {invoice_data.partner_name}"
+        if is_foreign and convert_to_idr:
+            narration += f" | Kurs {invoice_data.invoice_date}: 1 {invoice_data.currency} = Rp {rate:,.2f} (Orig: {invoice_data.currency} {invoice_data.total_amount:,.2f})"
 
         move_vals = {
             "move_type": invoice_data.invoice_type,
@@ -295,14 +361,16 @@ class OdooAccountingAgent:
             "invoice_date": invoice_data.invoice_date,
             "company_id": self.company_id,
             "ref": invoice_data.invoice_number or f"VOUCHER-{invoice_data.invoice_date}",
-            "narration": invoice_data.notes or f"Bukti Kas Keluar - {invoice_data.partner_name}",
+            "narration": narration,
             "invoice_line_ids": invoice_lines_payload,
         }
         if currency_id:
             move_vals["currency_id"] = currency_id
             print(f"  • Currency: {invoice_data.currency} (ID: {currency_id})")
         else:
-            print(f"  • Currency: IDR (Company default)")
+            print(f"  • Currency: IDR (Company base Rupiah)")
+            if is_foreign and convert_to_idr:
+                print(f"  • Total Booked in Rupiah: Rp {total_booked_idr:,.2f}")
 
         if invoice_data.due_date:
             move_vals["invoice_date_due"] = invoice_data.due_date
@@ -366,6 +434,7 @@ def main():
     parser.add_argument("--type", choices=["in_invoice", "out_invoice"], default="in_invoice", help="Move type (default: in_invoice for Vendor Bill/Expense)")
     parser.add_argument("--post", action="store_true", help="Automatically post / confirm the bill in Odoo")
     parser.add_argument("--dry-run", action="store_true", help="Extract and display invoice details without creating in Odoo")
+    parser.add_argument("--no-convert", action="store_true", help="Do not convert foreign currency to IDR (default: auto-converts to IDR using invoice date average rate)")
     parser.add_argument("--key", default="", help="Override Odoo API Key if needed")
 
     args = parser.parse_args()
@@ -460,14 +529,15 @@ def main():
 
     # 4. Create invoice, vendor, and products
     try:
-        move_info = agent.create_invoice_move(invoice_data, target_image, auto_post=args.post)
+        move_info = agent.create_invoice_move(invoice_data, target_image, auto_post=args.post, convert_to_idr=not args.no_convert)
         print("\n" + "=" * 70)
         print(" ✅ SUCCESS! INVOICE ENTERED INTO ODOO ACCOUNTING")
         print("=" * 70)
         print(f"  • Number  : {move_info.get('name') or '(Draft)'}")
         print(f"  • Status  : {move_info.get('state')}")
         print(f"  • Company : {move_info.get('company_id')[1] if move_info.get('company_id') else args.company}")
-        print(f"  • Total   : {invoice_data.currency} {move_info.get('amount_total', 0):,.2f}")
+        tot_curr = "IDR" if not args.no_convert and (invoice_data.currency or '').upper() not in ('IDR', 'RP') else invoice_data.currency
+        print(f"  • Total   : {tot_curr} {move_info.get('amount_total', 0):,.2f}")
         print(f"  • Attachment: Original picture permanently attached to record in Odoo.")
         print("=" * 70)
     except Exception as e:
