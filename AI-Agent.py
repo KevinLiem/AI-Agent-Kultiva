@@ -25,7 +25,7 @@ if os.path.exists(".env"):
 
 import base64
 
-_DEF_ODOO_KEY = base64.b64decode(b"YzY1ZTA4MDRlYWU0YTk2ZDZjNWRjOTJjNzc2M2M2OTdjMTM2MzUwMQ==").decode("ascii")
+_DEF_ODOO_KEY = base64.b64decode(b"OGU3ZjczNzQxNGNkOTMyOGM4MDMzZjRmNjI3YTBiYzU0NGUyZWMwZg==").decode("ascii")
 _DEF_GEM_KEY = base64.b64decode(b"QVEuQWI4Uk42Sm42ZnhqSTJtd011ZERrQ0o0QnJWNmk0amtERDdGTHpxQVM2U0JEMmkwREE=").decode("ascii")
 
 URL = os.getenv("ODOO_URL", "https://kultiva.odoo.com")
