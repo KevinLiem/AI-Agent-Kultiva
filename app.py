@@ -112,7 +112,7 @@ with st.sidebar:
     
     if ai_provider == "Google Gemini":
         gemini_key = st.text_input("Google Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
-        gemini_model = st.selectbox("Gemini Model", ["gemini-3.5-flash-lite", "gemini-2.5-flash"], index=0)
+        gemini_model = st.selectbox("Gemini Model", ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"], index=0)
         claude_key = ""
         claude_model = ""
     else:
@@ -213,6 +213,28 @@ class PurchaseOrderExtraction(BaseModel):
     delivery_warehouse: str | None = Field(default=None, description="Delivery warehouse / ship to location")
     notes: str | None = Field(default=None, description="Delivery notes or remarks")
     items: list[PurchaseOrderItem] = Field(description="List of items in the PO")
+
+# --- INVOICE & BUKTI KAS EXTRACTION SCHEMA ---
+class InvoiceLineItem(BaseModel):
+    description: str = Field(description="Description of product, service, insurance, or expense line item")
+    quantity: float = Field(default=1.0, description="Quantity or volume of items")
+    uom: str = Field(default="Units", description="Unit of measurement, e.g. PCS, UNIT, BULAN, PAKET")
+    unit_price: float = Field(description="Unit price or amount before tax")
+    subtotal: float | None = Field(default=None, description="Subtotal amount for this line")
+
+class InvoiceExtraction(BaseModel):
+    invoice_type: str = Field(
+        default="in_invoice",
+        description="Accounting type: 'in_invoice' for Vendor Bill / Bukti Kas Keluar / Supplier Invoice / Expense, or 'out_invoice' for Customer Invoice."
+    )
+    partner_name: str = Field(description="Vendor / Supplier / Recipient name (e.g. 'Dibayarkan Kepada / Paid To') or Customer name.")
+    invoice_number: str = Field(default="", description="Invoice number, voucher number, or reference number on document if present.")
+    invoice_date: str = Field(description="Transaction or invoice date in YYYY-MM-DD format.")
+    due_date: str | None = Field(default=None, description="Due date in YYYY-MM-DD format if mentioned, else None.")
+    currency: str = Field(default="IDR", description="Currency symbol/code, e.g. USD, IDR, EUR. (Carefully note if Rp is crossed out and USD is written).")
+    notes: str | None = Field(default=None, description="Notes, remarks, perkiraan, or description written on the voucher.")
+    items: list[InvoiceLineItem] = Field(description="Line items listed on the invoice / voucher.")
+    total_amount: float = Field(description="Total invoice or voucher amount.")
 
 # --- MULTI-CLIENT & COMPANY ROUTING ---
 def get_client_and_company(customer_name, items=None):
@@ -331,11 +353,12 @@ st.markdown('<div class="main-header">🚀 Kultiva & Alpha Mas Indo — Odoo AI 
 st.markdown('<div class="sub-header">Automated PO to Sales Order Processing • Odoo External API Integration • Interactive ERP Chat Agent</div>', unsafe_allow_html=True)
 
 # TABS INTERFACE
-tab_po, tab_assistant, tab_explorer, tab_editor = st.tabs([
+tab_po, tab_invoice, tab_editor, tab_assistant, tab_explorer = st.tabs([
     "📄 Purchase Order AI Agent",
+    "🧾 Invoice & Bukti Kas (Accounting)",
+    "✏️ Edit Sales Order",
     "💬 Odoo Natural Language Assistant",
-    "🔍 Odoo Records Explorer",
-    "✏️ Edit Sales Order"
+    "🔍 Odoo Records Explorer"
 ])
 
 # ==============================================================================
@@ -639,7 +662,369 @@ with tab_po:
                     st.error(f"Error communicating with Odoo: {e}")
 
 # ==============================================================================
-# TAB 2: ODOO NATURAL LANGUAGE ASSISTANT (CHAT WITH ERP)
+# TAB 2: INVOICE & BUKTI KAS ACCOUNTING AGENT
+# ==============================================================================
+with tab_invoice:
+    st.subheader("🧾 Invoice, Receipt & Bukti Kas to Odoo Accounting")
+    st.caption(
+        "Upload any invoice, bill, receipt, or Bukti Kas Keluar photo/PDF. "
+        "Review and edit the extracted data first before creating the bill in Odoo Accounting. "
+        "New vendors and products will be created automatically in Odoo!"
+    )
+
+    inv_upload = st.file_uploader(
+        "Upload Invoice / Bukti Kas Picture or PDF",
+        type=["pdf", "jpeg", "jpg", "png", "webp"],
+        key="inv_file_uploader",
+        help="Upload an invoice, supplier bill, receipt, or Bukti Kas Keluar image or PDF"
+    )
+
+    if inv_upload is not None:
+        inv_file_bytes = inv_upload.read()
+        inv_file_name = inv_upload.name
+        inv_mime_type = inv_upload.type or mimetypes.guess_type(inv_file_name)[0] or "application/octet-stream"
+
+        col_inv_left, col_inv_right = st.columns([1, 2])
+        with col_inv_left:
+            st.subheader("📄 Uploaded Document")
+            st.caption(f"**Name:** `{inv_file_name}` | **Size:** `{len(inv_file_bytes)/1024:.1f} KB`")
+            if inv_mime_type.startswith("image/"):
+                st.image(inv_file_bytes, use_container_width=True)
+            elif inv_mime_type == "application/pdf":
+                st.info("📑 PDF Document loaded ready for processing.")
+
+        with col_inv_right:
+            st.subheader("⚡ Processing & Target Options")
+            inv_target_company = st.selectbox(
+                "Accounting Target Company",
+                ["PT Kultiva Indonesia Makmur (ID: 1)", "PT Alpha Mas Indo (ID: 8)"],
+                index=0,
+                key="inv_company_select"
+            )
+            inv_company_id = 8 if "Alpha Mas" in inv_target_company else 1
+            inv_auto_post = st.checkbox(
+                "Automatically Confirm / Post Bill in Accounting (Action Post)",
+                value=False,
+                key="inv_auto_post_checkbox",
+                help="If unchecked, bill will be saved as 'Draft' so finance can review before posting."
+            )
+
+            if st.button(f"🔍 Analyze Invoice with {ai_provider}", type="primary", use_container_width=True, key="btn_analyze_invoice"):
+                with st.spinner(f"🤖 Extracting invoice data with {ai_provider}..."):
+                    try:
+                        extracted_inv = None
+                        if ai_provider == "Google Gemini":
+                            if not gemini_key:
+                                st.error("Please enter a Google Gemini API Key in the sidebar.")
+                                st.stop()
+                            ai_client = genai.Client(api_key=gemini_key)
+                            prompt_text = (
+                                "You are an expert corporate accounting OCR system. Carefully analyze this invoice / Bukti Kas Keluar / "
+                                "receipt / payment voucher image.\n\n"
+                                "Instructions:\n"
+                                "1. Extract the Vendor / Recipient / Dibayarkan Kepada as 'partner_name'.\n"
+                                "2. Extract the transaction date formatted as YYYY-MM-DD.\n"
+                                "3. Detect the currency: check if standard currency (like Rp) was crossed out and replaced with another currency like USD. "
+                                "   If USD is written, set currency to 'USD'.\n"
+                                "4. Extract all line items (Uraian) with their description, quantity (default to 1.0 if not listed), unit price, and subtotal.\n"
+                                "5. Extract the total amount accurately.\n"
+                                "6. Set 'invoice_type' to 'in_invoice' for bills/expenses paid to vendors/suppliers, or 'out_invoice' for customer sales."
+                            )
+                            # Pick verified model
+                            active_gem_model = gemini_model if gemini_model != "gemini-2.5-flash" else "gemini-3.5-flash"
+                            response = ai_client.models.generate_content(
+                                model=active_gem_model,
+                                contents=[
+                                    types.Part.from_bytes(data=inv_file_bytes, mime_type=inv_mime_type),
+                                    prompt_text
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    response_schema=InvoiceExtraction,
+                                    temperature=0.1,
+                                ),
+                            )
+                            extracted_inv = json.loads(response.text)
+                        else:
+                            # Anthropic Claude
+                            import anthropic
+                            if not claude_key:
+                                st.error("Please enter an Anthropic Claude API Key (sk-ant-...).")
+                                st.stop()
+                            cl_client = anthropic.Anthropic(api_key=claude_key)
+                            b64_data = base64.b64encode(inv_file_bytes).decode("ascii")
+                            content_blocks = []
+                            if inv_mime_type == "application/pdf":
+                                content_blocks.append({
+                                    "type": "document",
+                                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data}
+                                })
+                            else:
+                                media_t = inv_mime_type if inv_mime_type.startswith("image/") else "image/jpeg"
+                                content_blocks.append({
+                                    "type": "image",
+                                    "source": {"type": "base64", "media_type": media_t, "data": b64_data}
+                                })
+                            schema_desc = json.dumps(InvoiceExtraction.model_json_schema(), indent=2)
+                            content_blocks.append({
+                                "type": "text",
+                                "text": (
+                                    "You are an expert accounting OCR system. Analyze this invoice or Bukti Kas Keluar document.\n"
+                                    "Extract partner name, date (YYYY-MM-DD), currency (e.g. USD if Rp is crossed out), line items, and total amount.\n\n"
+                                    f"Respond ONLY with a valid JSON object matching this schema:\n{schema_desc}"
+                                )
+                            })
+                            claude_res = cl_client.messages.create(
+                                model=claude_model,
+                                max_tokens=4096,
+                                messages=[{"role": "user", "content": content_blocks}]
+                            )
+                            raw_text = claude_res.content[0].text
+                            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                            extracted_inv = json.loads(json_match.group(0)) if json_match else json.loads(raw_text)
+
+                        st.session_state["extracted_inv_data"] = extracted_inv
+                        st.session_state["inv_uploaded_file"] = {"name": inv_file_name, "bytes": inv_file_bytes}
+                        st.success("✅ Invoice data extracted successfully! Please review below.")
+                    except Exception as e:
+                        st.error(f"Error during AI invoice extraction: {e}")
+
+        # --- REVIEW & EDIT SECTION ---
+        if "extracted_inv_data" in st.session_state:
+            inv_data = st.session_state["extracted_inv_data"]
+            st.divider()
+            st.subheader("📋 Step 2: Review & Verify Data (Edit before sending to Odoo)")
+            st.info("💡 You can edit any field below or modify the line items table before clicking 'Create in Odoo'.")
+
+            # General details form
+            c_ed1, c_ed2, c_ed3, c_ed4 = st.columns(4)
+            with c_ed1:
+                edit_partner = st.text_input("Vendor / Partner Name", value=inv_data.get("partner_name", ""), key="edit_inv_partner")
+            with c_ed2:
+                edit_date = st.text_input("Invoice Date (YYYY-MM-DD)", value=inv_data.get("invoice_date", datetime.today().strftime("%Y-%m-%d")), key="edit_inv_date")
+            with c_ed3:
+                edit_currency = st.text_input("Currency (e.g. USD, IDR)", value=inv_data.get("currency", "IDR").upper(), key="edit_inv_currency")
+            with c_ed4:
+                edit_ref = st.text_input("Voucher / Ref Number", value=inv_data.get("invoice_number", ""), placeholder="e.g. VOUCHER-001", key="edit_inv_ref")
+
+            c_ed5, c_ed6, c_ed7 = st.columns([1, 1, 2])
+            with c_ed5:
+                edit_type = st.selectbox(
+                    "Accounting Type",
+                    ["Vendor Bill (in_invoice)", "Customer Invoice (out_invoice)"],
+                    index=0 if inv_data.get("invoice_type") == "in_invoice" else 1,
+                    key="edit_inv_type"
+                )
+                chosen_move_type = "in_invoice" if "in_invoice" in edit_type else "out_invoice"
+            with c_ed6:
+                edit_due_date = st.text_input("Due Date (optional)", value=inv_data.get("due_date") or "", key="edit_inv_due_date")
+            with c_ed7:
+                edit_notes = st.text_input("Notes / Keterangan", value=inv_data.get("notes") or "", placeholder="Remarks or expense category", key="edit_inv_notes")
+
+            # Editable Line Items Table
+            st.write("**Line Items (Editable Table):**")
+            raw_items = inv_data.get("items", [])
+            initial_rows = []
+            for it in raw_items:
+                q = float(it.get("quantity") or 1.0)
+                p = float(it.get("unit_price") or 0.0)
+                initial_rows.append({
+                    "Description": it.get("description", ""),
+                    "Quantity": q,
+                    "Unit Price": p,
+                    "Subtotal": q * p
+                })
+            if not initial_rows:
+                initial_rows = [{"Description": "Service / Expense", "Quantity": 1.0, "Unit Price": 0.0, "Subtotal": 0.0}]
+
+            df_items_init = pd.DataFrame(initial_rows)
+            edited_df = st.data_editor(
+                df_items_init,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="inv_items_editor",
+                column_config={
+                    "Description": st.column_config.TextColumn("Description / Uraian", required=True, width="large"),
+                    "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.01, step=1.0, required=True),
+                    "Unit Price": st.column_config.NumberColumn("Unit Price", min_value=0.0, step=100.0, required=True),
+                    "Subtotal": st.column_config.NumberColumn("Subtotal", disabled=True),
+                }
+            )
+
+            # Recalculate Subtotal & Grand Total
+            calculated_grand_total = 0.0
+            valid_lines = []
+            for _, r in edited_df.iterrows():
+                desc = str(r.get("Description") or "").strip()
+                if desc:
+                    qty = float(r.get("Quantity") or 1.0)
+                    price = float(r.get("Unit Price") or 0.0)
+                    sub = qty * price
+                    calculated_grand_total += sub
+                    valid_lines.append({"description": desc, "quantity": qty, "unit_price": price, "subtotal": sub})
+
+            c_gt1, c_gt2 = st.columns([3, 1])
+            with c_gt2:
+                st.metric("Total Invoice Amount", f"{edit_currency} {calculated_grand_total:,.2f}")
+
+            # --- LIVE ODOO PRE-SUBMISSION STATUS ---
+            st.divider()
+            st.subheader("🔍 Step 3: Odoo Pre-Submission Verification")
+            with st.spinner("Checking Odoo records for vendor and products..."):
+                try:
+                    # 1. Check Vendor in Odoo
+                    partner_results = odoo.search_read(
+                        "res.partner",
+                        domain=[["name", "ilike", edit_partner.strip()]],
+                        fields=["id", "name", "company_id"],
+                        limit=1,
+                        company_id=inv_company_id
+                    )
+                    if partner_results:
+                        p_rec = partner_results[0]
+                        st.success(f"✓ **Existing Vendor Found in Odoo:** `{p_rec['name']}` (ID: `{p_rec['id']}`)")
+                    else:
+                        st.info(f"✨ **New Vendor will be automatically created in Odoo:** `{edit_partner.strip()}` (supplier_rank: 1)")
+
+                    # 2. Check Products in Odoo
+                    matched_prods = 0
+                    new_prods = 0
+                    for line in valid_lines:
+                        p_search = odoo.search_read(
+                            "product.product",
+                            domain=[["name", "ilike", line["description"]]],
+                            fields=["id", "name"],
+                            limit=1,
+                            company_id=inv_company_id
+                        )
+                        if p_search:
+                            matched_prods += 1
+                        else:
+                            new_prods += 1
+
+                    st.markdown(f"""
+                    - **Products Check:** `{matched_prods}` existing product(s) matched | `{new_prods}` new product/service(s) will be created automatically.
+                    - **Currency:** `{edit_currency}`
+                    - **Target Company:** `{inv_target_company}`
+                    """)
+
+                    # --- CREATE IN ODOO BUTTON ---
+                    if st.button("🚀 Confirm & Create Bill in Odoo Accounting", type="primary", use_container_width=True, key="btn_create_inv_odoo"):
+                        with st.spinner("Creating Vendor Bill and attaching document in Odoo..."):
+                            # A. Get or Create Partner
+                            if partner_results:
+                                final_partner_id = partner_results[0]["id"]
+                            else:
+                                p_vals = {
+                                    "name": edit_partner.strip(),
+                                    "company_id": inv_company_id,
+                                }
+                                if chosen_move_type == "in_invoice":
+                                    p_vals["supplier_rank"] = 1
+                                else:
+                                    p_vals["customer_rank"] = 1
+                                final_partner_id = odoo.call("res.partner", "create", [p_vals], company_id=inv_company_id)
+
+                            # B. Get or Create Products for each line
+                            move_lines_payload = []
+                            for line in valid_lines:
+                                p_search = odoo.search_read(
+                                    "product.product",
+                                    domain=[["name", "ilike", line["description"]]],
+                                    fields=["id", "name"],
+                                    limit=1,
+                                    company_id=inv_company_id
+                                )
+                                if p_search:
+                                    prod_id = p_search[0]["id"]
+                                else:
+                                    # Create new product / service
+                                    new_prod_vals = {
+                                        "name": line["description"],
+                                        "type": "service",
+                                        "purchase_ok": True,
+                                        "sale_ok": False,
+                                        "standard_price": float(line["unit_price"]),
+                                        "company_id": inv_company_id,
+                                    }
+                                    prod_id = odoo.call("product.product", "create", [new_prod_vals], company_id=inv_company_id)
+
+                                move_lines_payload.append((0, 0, {
+                                    "product_id": prod_id,
+                                    "name": line["description"],
+                                    "quantity": float(line["quantity"]),
+                                    "price_unit": float(line["unit_price"]),
+                                }))
+
+                            # C. Currency handling
+                            currency_id = None
+                            if edit_currency and edit_currency.upper() not in ("IDR", "RP"):
+                                c_recs = odoo.search_read("res.currency", domain=[["name", "=", edit_currency.upper()]], fields=["id"], limit=1)
+                                if c_recs:
+                                    currency_id = c_recs[0]["id"]
+
+                            # D. Create account.move
+                            move_vals = {
+                                "move_type": chosen_move_type,
+                                "partner_id": final_partner_id,
+                                "invoice_date": edit_date.strip(),
+                                "company_id": inv_company_id,
+                                "ref": edit_ref.strip() or f"VOUCHER-{edit_date.strip()}",
+                                "narration": edit_notes.strip() or f"Bukti Kas Keluar - {edit_partner.strip()}",
+                                "invoice_line_ids": move_lines_payload,
+                            }
+                            if currency_id:
+                                move_vals["currency_id"] = currency_id
+                            if edit_due_date.strip():
+                                move_vals["invoice_date_due"] = edit_due_date.strip()
+
+                            created_move_id = odoo.call("account.move", "create", [move_vals], company_id=inv_company_id)
+
+                            # E. Attach original uploaded image to account.move
+                            if "inv_uploaded_file" in st.session_state:
+                                f_inv = st.session_state["inv_uploaded_file"]
+                                try:
+                                    odoo.attach_file(
+                                        file_name=f_inv["name"],
+                                        file_bytes=f_inv["bytes"],
+                                        res_model="account.move",
+                                        res_id=created_move_id,
+                                        company_id=inv_company_id
+                                    )
+                                except Exception as e_att:
+                                    st.warning(f"Note: Could not attach file: {e_att}")
+
+                            # F. Auto-post if requested
+                            if inv_auto_post:
+                                try:
+                                    odoo.call("account.move", "action_post", [[created_move_id]], company_id=inv_company_id)
+                                except Exception as e_p:
+                                    st.warning(f"Could not auto-post: {e_p}")
+
+                            # G. Read created bill details
+                            move_info = odoo.call(
+                                "account.move", "read",
+                                [created_move_id],
+                                {"fields": ["name", "state", "amount_total", "company_id"]},
+                                company_id=inv_company_id
+                            )[0]
+
+                            st.balloons()
+                            st.success("🎉 **Invoice / Vendor Bill Entered Successfully into Odoo Accounting!**")
+                            st.markdown(f"""
+                            - **Bill Reference / Name:** `{move_info.get('name') or '(Draft)'}` (ID: `{created_move_id}`)
+                            - **Status:** `{move_info.get('state')}`
+                            - **Company:** `{move_info.get('company_id')[1] if move_info.get('company_id') else inv_target_company}`
+                            - **Total Amount:** **{edit_currency} {move_info.get('amount_total', calculated_grand_total):,.2f}**
+                            - **Vendor:** `{edit_partner}` (ID: `{final_partner_id}`)
+                            - **Document:** Original picture permanently attached to the bill in Odoo.
+                            """)
+
+                except Exception as e:
+                    st.error(f"Error communicating with Odoo: {e}")
+
+# ==============================================================================
+# TAB 3: ODOO NATURAL LANGUAGE ASSISTANT (CHAT WITH ERP)
 # ==============================================================================
 with tab_assistant:
     st.subheader("💬 Ask Odoo in Plain English")
