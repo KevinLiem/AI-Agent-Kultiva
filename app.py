@@ -83,12 +83,12 @@ def get_config(key, default=""):
     return os.getenv(key, default)
 
 # Fallback defaults decoded at runtime so keys are always automatically populated
-_DEF_ODOO_KEY = base64.b64decode(b"OGU3ZjczNzQxNGNkOTMyOGM4MDMzZjRmNjI3YTBiYzU0NGUyZWMwZg==").decode("ascii")
+_DEF_ODOO_KEY = base64.b64decode(b"NWQ0N2VkMGJkY2NmZDFjN2YzMTM2NDVhODFhODRhZDkxNDdlNDE2Mg==").decode("ascii")
 _DEF_GEM_KEY = base64.b64decode(b"QVEuQWI4Uk42Sm42ZnhqSTJtd011ZERrQ0o0QnJWNmk0amtERDdGTHpxQVM2U0JEMmkwREE=").decode("ascii")
 
 DEFAULT_ODOO_URL = get_config("ODOO_URL", "https://kultiva.odoo.com")
 DEFAULT_ODOO_DB = get_config("ODOO_DB", "kultiva")
-DEFAULT_ODOO_USER = get_config("ODOO_USERNAME", "ppicjkt@kultivaco.com")
+DEFAULT_ODOO_USER = get_config("ODOO_USERNAME", "finance@kultivaco.com")
 DEFAULT_ODOO_KEY = get_config("ODOO_API_KEY", _DEF_ODOO_KEY)
 DEFAULT_GEMINI_KEY = get_config("GEMINI_API_KEY", _DEF_GEM_KEY)
 DEFAULT_CLAUDE_KEY = get_config("ANTHROPIC_API_KEY", "")

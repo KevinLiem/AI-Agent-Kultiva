@@ -51,12 +51,12 @@ def load_env_file():
 
 load_env_file()
 
-_DEF_ODOO_KEY = base64.b64decode(b"OGU3ZjczNzQxNGNkOTMyOGM4MDMzZjRmNjI3YTBiYzU0NGUyZWMwZg==").decode("ascii")
+_DEF_ODOO_KEY = base64.b64decode(b"NWQ0N2VkMGJkY2NmZDFjN2YzMTM2NDVhODFhODRhZDkxNDdlNDE2Mg==").decode("ascii")
 _DEF_GEM_KEY = base64.b64decode(b"QVEuQWI4Uk42Sm42ZnhqSTJtd011ZERrQ0o0QnJWNmk0amtERDdGTHpxQVM2U0JEMmkwREE=").decode("ascii")
 
 ODOO_URL = os.getenv("ODOO_URL", "https://kultiva.odoo.com")
 ODOO_DB = os.getenv("ODOO_DB", "kultiva")
-ODOO_USER = os.getenv("ODOO_USERNAME", "ppicjkt@kultivaco.com")
+ODOO_USER = os.getenv("ODOO_USERNAME", "finance@kultivaco.com")
 ODOO_KEY = os.getenv("ODOO_API_KEY", _DEF_ODOO_KEY)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", _DEF_GEM_KEY)
 CLAUDE_KEY = os.getenv("ANTHROPIC_API_KEY", "")
