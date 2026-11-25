@@ -267,8 +267,6 @@ for item in plan:
     
     if old_name != new_name:
         update_vals = {"name": f"TMP2026/{b_id}"}
-        if not curr_ref and old_name and not old_name.startswith("BILL/") and old_name != "/":
-            update_vals["ref"] = old_name
         models.execute_kw(DB, uid, API_KEY, "account.move", "write", [[b_id], update_vals], {"context": ctx})
 
 # Phase 2: Final sequential names
