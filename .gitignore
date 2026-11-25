@@ -37,6 +37,17 @@ wheels/
 *.zip
 PO_extracted/
 study_*.py
+test_*.py
+check_*.py
+inspect_*.py
+simulate_*.py
+verify_*.py
+categorize_*.py
+analyze_*.py
+deep_inspect_*.py
+list_*.py
+preview_*.py
+print_*.py
 
 # Jupyter Notebooks & checkpoints
 *.ipynb
