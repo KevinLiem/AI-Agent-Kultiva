@@ -27,6 +27,7 @@ print(f"✓ Connected to Odoo as {USERNAME} (UID: {uid})")
 print(f"✓ Company: PT Kultiva Indonesia Makmur (ID: {COMPANY_ID})\n")
 
 # Target Account IDs
+ACC_BANK = 155        # 11120005 Bank
 ACC_PARKIR = 141        # 69000000 Other Expenses
 ACC_MAINTENANCE = 131   # 65110080 Asset Maintenance Costs
 ACC_PETTY_CASH = 49     # 11110010 Petty Cash
@@ -116,6 +117,10 @@ def classify_line_final(l):
         "gas tabung", "karton", "box", "lakban", "opp tape", "anbac", "minyak", "oil"
     ]) or "p00" in l_name or (m.get("invoice_origin") and m.get("invoice_origin").startswith("P00"))
     
+    # 0. OOCL Expenses -> Bank (155)
+    if "oocl" in text or "oocl" in p_name:
+        return ACC_BANK, "0. OOCL Expenses -> Bank"
+
     # 1. Parkir / Parking / E-toll -> Other Expenses (141)
     if any(k in text for k in ["parkir", "parking", "e-toll", "tkkdm"]):
         return ACC_PARKIR, "1. Biaya parkir -> Other Expenses"
